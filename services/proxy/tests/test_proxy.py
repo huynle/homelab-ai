@@ -405,3 +405,9 @@ def test_access_log_for_unauthenticated_request(client, caplog):
 def test_openapi_docs_not_exposed(client):
     assert client.get("/docs").status_code in (401, 404)
     assert client.get("/openapi.json").status_code in (401, 404)
+
+
+def test_image_base64_with_whitespace_is_400(client, auth, image_request, backends):
+    image_request["image"]["base64"] = "/9j/4AAQ SkZJRgABAQAAAQABAAD/"
+    assert_error(client.post(IMAGE, json=image_request, headers=auth), 400, "invalid_request")
+    assert backends.requests == []

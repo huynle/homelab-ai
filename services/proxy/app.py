@@ -6,6 +6,7 @@ Run with ``python app.py`` or ``uvicorn app:create_app --factory``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import binascii
 import hashlib
 import hmac
@@ -323,7 +324,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise ApiError("invalid_request", f"candidate_labels: at most {MAX_LABELS} labels are allowed")
         req = _validate(ImageClassifyRequest, data)
         try:
-            binascii.a2b_base64(req.image.base64, strict_mode=True)
+            # validate=True rejects non-alphabet characters; works on Python 3.10 (a2b_base64 strict_mode is 3.11+)
+            base64.b64decode(req.image.base64, validate=True)
         except (binascii.Error, ValueError):
             raise ApiError("invalid_request", "image.base64: not valid standard base64") from None
 
