@@ -1,0 +1,148 @@
+{
+  "model": "google/siglip2-base-patch16-224",
+  "commit": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+  "snapshot": "/home/huy/image-test/models/hf-home/hub/models--google--siglip2-base-patch16-224/snapshots/75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+  "device": "cuda",
+  "dtype": "float32",
+  "torch": "2.14.1+cu126",
+  "transformers": "5.20.2",
+  "gpu": "Tesla P40",
+  "logit_scale": 112.66889953613281,
+  "softmax_over": "labels (logit_scale * cosine)",
+  "image": "/home/huy/image-test/data/receipts-three.jpg",
+  "date": "2026-11-01T20:47:45.171422",
+  "results": {
+    "full": {
+      "size": [
+        2000,
+        1496
+      ],
+      "top1": "a photo of a receipt",
+      "top3": [
+        {
+          "label": "a photo of a receipt",
+          "prob": 0.3721
+        },
+        {
+          "label": "a photo of a fuel receipt",
+          "prob": 0.3009
+        },
+        {
+          "label": "a photo of a grocery receipt",
+          "prob": 0.2621
+        }
+      ],
+      "all": {
+        "a photo of a receipt": 0.3721,
+        "a photo of a fuel receipt": 0.3009,
+        "a photo of a grocery receipt": 0.2621,
+        "a photo of a restaurant bill": 0.039,
+        "a photo of a hotel invoice": 0.025,
+        "a photo of a document": 0.0008,
+        "a screenshot of a website": 0.0,
+        "a photo of a dog": 0.0,
+        "a photo of a landscape": 0.0,
+        "a photo of a person": 0.0
+      }
+    },
+    "crop_left_receipt": {
+      "size": [
+        540,
+        1496
+      ],
+      "top1": "a photo of a fuel receipt",
+      "top3": [
+        {
+          "label": "a photo of a fuel receipt",
+          "prob": 0.9939
+        },
+        {
+          "label": "a photo of a receipt",
+          "prob": 0.0042
+        },
+        {
+          "label": "a photo of a grocery receipt",
+          "prob": 0.0008
+        }
+      ],
+      "all": {
+        "a photo of a receipt": 0.0042,
+        "a photo of a fuel receipt": 0.9939,
+        "a photo of a grocery receipt": 0.0008,
+        "a photo of a restaurant bill": 0.0006,
+        "a photo of a hotel invoice": 0.0005,
+        "a photo of a document": 0.0,
+        "a screenshot of a website": 0.0,
+        "a photo of a dog": 0.0,
+        "a photo of a landscape": 0.0,
+        "a photo of a person": 0.0
+      }
+    },
+    "crop_middle_receipt": {
+      "size": [
+        620,
+        1496
+      ],
+      "top1": "a photo of a fuel receipt",
+      "top3": [
+        {
+          "label": "a photo of a fuel receipt",
+          "prob": 0.5827
+        },
+        {
+          "label": "a photo of a receipt",
+          "prob": 0.2212
+        },
+        {
+          "label": "a photo of a grocery receipt",
+          "prob": 0.1413
+        }
+      ],
+      "all": {
+        "a photo of a receipt": 0.2212,
+        "a photo of a fuel receipt": 0.5827,
+        "a photo of a grocery receipt": 0.1413,
+        "a photo of a restaurant bill": 0.0399,
+        "a photo of a hotel invoice": 0.0145,
+        "a photo of a document": 0.0005,
+        "a screenshot of a website": 0.0,
+        "a photo of a dog": 0.0,
+        "a photo of a landscape": 0.0,
+        "a photo of a person": 0.0
+      }
+    },
+    "crop_right_receipt": {
+      "size": [
+        600,
+        1496
+      ],
+      "top1": "a photo of a receipt",
+      "top3": [
+        {
+          "label": "a photo of a receipt",
+          "prob": 0.4839
+        },
+        {
+          "label": "a photo of a grocery receipt",
+          "prob": 0.2568
+        },
+        {
+          "label": "a photo of a fuel receipt",
+          "prob": 0.2123
+        }
+      ],
+      "all": {
+        "a photo of a receipt": 0.4839,
+        "a photo of a fuel receipt": 0.2123,
+        "a photo of a grocery receipt": 0.2568,
+        "a photo of a restaurant bill": 0.0211,
+        "a photo of a hotel invoice": 0.023,
+        "a photo of a document": 0.0028,
+        "a screenshot of a website": 0.0,
+        "a photo of a dog": 0.0,
+        "a photo of a landscape": 0.0,
+        "a photo of a person": 0.0
+      }
+    }
+  }
+}

@@ -1,0 +1,300 @@
+{
+  "model": "google/siglip2-base-patch16-224",
+  "commit": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+  "dtype": "float32",
+  "torch": "2.14.1+cu126",
+  "transformers": "5.20.2",
+  "image": "/home/huy/image-test/data/german-shepherd.jpg",
+  "image_size": [
+    2000,
+    1165
+  ],
+  "crop_box": [
+    500,
+    100,
+    1600,
+    1100
+  ],
+  "template": "a photo of a {}",
+  "families": {
+    "general": [
+      "dog",
+      "german shepherd",
+      "cat",
+      "wolf",
+      "bird",
+      "horse",
+      "person",
+      "receipt",
+      "document",
+      "landscape"
+    ],
+    "dog_breed": [
+      "german shepherd",
+      "labrador",
+      "golden retriever",
+      "husky",
+      "poodle"
+    ]
+  },
+  "date": "2026-11-01T20:58:08.567687",
+  "devices": {
+    "cuda": {
+      "model_load_s": 2.134,
+      "inputs": {
+        "full": {
+          "size": [
+            2000,
+            1165
+          ],
+          "general": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9447
+              },
+              {
+                "label": "dog",
+                "prob": 0.0548
+              },
+              {
+                "label": "wolf",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "dog": 0.0548,
+              "german shepherd": 0.9447,
+              "cat": 0.0001,
+              "wolf": 0.0002,
+              "bird": 0.0,
+              "horse": 0.0,
+              "person": 0.0001,
+              "receipt": 0.0,
+              "document": 0.0,
+              "landscape": 0.0
+            }
+          },
+          "dog_breed": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9985
+              },
+              {
+                "label": "husky",
+                "prob": 0.0011
+              },
+              {
+                "label": "labrador",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "german shepherd": 0.9985,
+              "labrador": 0.0002,
+              "golden retriever": 0.0002,
+              "husky": 0.0011,
+              "poodle": 0.0
+            }
+          }
+        },
+        "crop_dog": {
+          "size": [
+            1100,
+            1000
+          ],
+          "general": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9297
+              },
+              {
+                "label": "dog",
+                "prob": 0.0698
+              },
+              {
+                "label": "wolf",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "dog": 0.0698,
+              "german shepherd": 0.9297,
+              "cat": 0.0001,
+              "wolf": 0.0002,
+              "bird": 0.0,
+              "horse": 0.0,
+              "person": 0.0001,
+              "receipt": 0.0,
+              "document": 0.0,
+              "landscape": 0.0
+            }
+          },
+          "dog_breed": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9982
+              },
+              {
+                "label": "husky",
+                "prob": 0.0013
+              },
+              {
+                "label": "labrador",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "german shepherd": 0.9982,
+              "labrador": 0.0002,
+              "golden retriever": 0.0002,
+              "husky": 0.0013,
+              "poodle": 0.0001
+            }
+          }
+        }
+      },
+      "logit_scale": 112.66889953613281,
+      "gpu": "Tesla P40"
+    },
+    "cpu": {
+      "model_load_s": 0.584,
+      "inputs": {
+        "full": {
+          "size": [
+            2000,
+            1165
+          ],
+          "general": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9447
+              },
+              {
+                "label": "dog",
+                "prob": 0.0548
+              },
+              {
+                "label": "wolf",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "dog": 0.0548,
+              "german shepherd": 0.9447,
+              "cat": 0.0001,
+              "wolf": 0.0002,
+              "bird": 0.0,
+              "horse": 0.0,
+              "person": 0.0001,
+              "receipt": 0.0,
+              "document": 0.0,
+              "landscape": 0.0
+            }
+          },
+          "dog_breed": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9985
+              },
+              {
+                "label": "husky",
+                "prob": 0.0011
+              },
+              {
+                "label": "labrador",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "german shepherd": 0.9985,
+              "labrador": 0.0002,
+              "golden retriever": 0.0002,
+              "husky": 0.0011,
+              "poodle": 0.0
+            }
+          }
+        },
+        "crop_dog": {
+          "size": [
+            1100,
+            1000
+          ],
+          "general": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9297
+              },
+              {
+                "label": "dog",
+                "prob": 0.0698
+              },
+              {
+                "label": "wolf",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "dog": 0.0698,
+              "german shepherd": 0.9297,
+              "cat": 0.0001,
+              "wolf": 0.0002,
+              "bird": 0.0,
+              "horse": 0.0,
+              "person": 0.0001,
+              "receipt": 0.0,
+              "document": 0.0,
+              "landscape": 0.0
+            }
+          },
+          "dog_breed": {
+            "top1": "german shepherd",
+            "top3": [
+              {
+                "label": "german shepherd",
+                "prob": 0.9982
+              },
+              {
+                "label": "husky",
+                "prob": 0.0013
+              },
+              {
+                "label": "labrador",
+                "prob": 0.0002
+              }
+            ],
+            "all": {
+              "german shepherd": 0.9982,
+              "labrador": 0.0002,
+              "golden retriever": 0.0002,
+              "husky": 0.0013,
+              "poodle": 0.0001
+            }
+          }
+        }
+      },
+      "logit_scale": 112.66889953613281
+    }
+  },
+  "timing_gpu_e2e": {
+    "model_load_s": 1.128,
+    "runs": 20,
+    "warmup": 3,
+    "median_s": 0.0645,
+    "min_s": 0.0573,
+    "max_s": 0.2237
+  }
+}

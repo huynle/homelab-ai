@@ -1,0 +1,694 @@
+openapi: 3.1.0
+info:
+  title: Homelab Decision API
+  version: 1.0.0
+  summary: Typed text decisions (Laya) and zero-shot image classification (SigLIP2) behind one contract.
+  description: |
+    A small proxy on the `ml` VM that fronts two local backends:
+
+    - **text** - Laya (`laya[serve]` 0.4.20) typed decisions: `choice`, `score`, `noul`.
+    - **image** - SigLIP2 zero-shot classification
+      (`google/siglip2-base-patch16-224`, commit `75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2`).
+
+    Every successful response is an `Envelope`; every failure is an `ErrorEnvelope`
+    whose `error.code` maps to exactly one HTTP status:
+
+    | code                  | HTTP |
+    |-----------------------|------|
+    | `invalid_request`     | 400  |
+    | `unauthorized`        | 401  |
+    | `payload_too_large`   | 413  |
+    | `internal_error`      | 500  |
+    | `backend_error`       | 502  |
+    | `backend_unavailable` | 503  |
+    | `backend_timeout`     | 504  |
+
+    Limits:
+
+    - text `state`: at most 32 KiB (32768 bytes) once serialized as UTF-8 JSON (a string state
+      counts its UTF-8 bytes); at most 32 questions per request.
+    - image: at most 8 MiB (8388608 bytes) after base64 decoding; at most 64 candidate labels.
+
+    Exceeding a size limit returns 413 `payload_too_large`; exceeding a count limit returns
+    400 `invalid_request`.
+
+    All routes require a bearer API key except `GET /v1/health`.
+servers:
+  - url: http://127.0.0.1:{port}
+    variables:
+      port:
+        default: "8080"
+        description: Port the decision API listens on.
+security:
+  - apiKey: []
+tags:
+  - name: text
+  - name: image
+  - name: ops
+paths:
+  /v1/decide/text:
+    post:
+      tags: [text]
+      operationId: decideText
+      summary: Answer typed questions about a text or JSON state (Laya).
+      description: |
+        Forwards to Laya `POST /predict`. Laya's `answers` become `results`; Laya's
+        `routing` and `usage` objects are passed through under `meta.routing` and `meta.usage`
+        (local filesystem fields such as `routing.repo` are stripped by the proxy).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TextDecisionRequest"
+            examples:
+              support_ticket:
+                summary: Real request (api/fixtures/laya-predict.request.json)
+                value:
+                  state:
+                    from: user@acme.com
+                    subject: "Duplicate charge on invoice #4411"
+                    body: We were billed twice for March. Please refund it today or we will cancel.
+                  questions:
+                    department:
+                      type: choice
+                      instructions: Which department should handle this request?
+                      criteria:
+                        billing: invoices, payments, refunds
+                        technical: bugs, outages, system errors
+                        sales: pricing, new contracts
+                        other: everything else
+                    urgency:
+                      type: score
+                      instructions: How urgent is this request?
+                      criteria: [not urgent, soon, critical deadline or blocking issue]
+                    churn_risk:
+                      type: noul
+                      instructions: Does the user threaten to cancel or leave?
+      responses:
+        "200":
+          description: Decisions for every question.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TextDecisionEnvelope"
+              examples:
+                support_ticket:
+                  summary: Real Laya answer (api/fixtures/laya-predict.json), wrapped in the envelope
+                  value:
+                    model: laya-english
+                    model_version: laya-serve-0.4.20
+                    latency_ms: 575
+                    results:
+                      department:
+                        type: choice
+                        choice: billing
+                        probabilities: {billing: 0.9801, technical: 0.008, sales: 0.0053, other: 0.0066}
+                        confidence: 0.9141
+                        answer_confidence: 0.9801
+                        action: {act_probability: 1.0}
+                      urgency:
+                        type: score
+                        score: 1.4386
+                        legend: {"0": not urgent, "1": soon, "2": critical deadline or blocking issue}
+                        probabilities: {"0": 0.104, "1": 0.3535, "2": 0.5426}
+                        confidence: 0.1492
+                        answer_confidence: 0.5426
+                        action: {act_probability: 1.0}
+                      churn_risk:
+                        type: noul
+                        noul: 0.8184
+                        confidence: 0.8184
+                        answer_confidence: 0.8184
+                        action: {act_probability: 1.0}
+                    meta:
+                      backend_model: laya-rl-agent
+                      usage:
+                        input_tokens: 249
+                        output_tokens: 0
+                        state_tokens: 45
+                        state_tokens_dropped: 0
+                        truncated: false
+                        truncated_questions: []
+                      routing:
+                        model: english
+                        reason: English Latin text
+                        detection:
+                          script: latin
+                          script_profile: {latin: 1.0}
+                          language: en
+                          is_english: true
+                          language_undecided: false
+                          diacritic_rate: 0.0
+                          non_latin_fraction: 0.0
+                          mixed_segment: null
+                        workflow: null
+        "400": {$ref: "#/components/responses/InvalidRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "500": {$ref: "#/components/responses/InternalError"}
+        "502": {$ref: "#/components/responses/BackendError"}
+        "503": {$ref: "#/components/responses/BackendUnavailable"}
+        "504": {$ref: "#/components/responses/BackendTimeout"}
+  /v1/classify/image:
+    post:
+      tags: [image]
+      operationId: classifyImage
+      summary: Zero-shot classify an image against candidate labels (SigLIP2).
+      description: |
+        Follows the Hugging Face `zero-shot-image-classification` convention: `candidate_labels`,
+        `hypothesis_template`, and a result list of `{label, score}` sorted by descending score.
+        Each label is inserted into `hypothesis_template` before text encoding; `results[].label`
+        is the original candidate label, not the filled template. Scores are a softmax over the
+        candidate labels of `logit_scale * cosine(image, text)`, so they sum to ~1 across all
+        candidates (before `top_k` truncation).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageClassifyRequest"
+            examples:
+              dog:
+                summary: Labels from api/fixtures/siglip-dog-results.json ("general" family); image bytes elided
+                value:
+                  image:
+                    base64: /9j/4AAQSkZJRgABAQAAAQABAAD...
+                    media_type: image/jpeg
+                  candidate_labels: [dog, german shepherd, cat, wolf, bird, horse, person, receipt, document, landscape]
+                  hypothesis_template: a photo of a {}
+                  top_k: 3
+      responses:
+        "200":
+          description: Labels sorted by descending score.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageClassifyEnvelope"
+              examples:
+                dog:
+                  summary: Real SigLIP2 output (siglip-dog-results.json, cuda, full image, top 3); latency is the measured GPU e2e median
+                  value:
+                    model: siglip2-base-patch16-224
+                    model_version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+                    latency_ms: 64.5
+                    results:
+                      - {label: german shepherd, score: 0.9447}
+                      - {label: dog, score: 0.0548}
+                      - {label: wolf, score: 0.0002}
+                    meta:
+                      hypothesis_template: a photo of a {}
+                      device: cuda
+        "400": {$ref: "#/components/responses/InvalidRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "500": {$ref: "#/components/responses/InternalError"}
+        "502": {$ref: "#/components/responses/BackendError"}
+        "503": {$ref: "#/components/responses/BackendUnavailable"}
+        "504": {$ref: "#/components/responses/BackendTimeout"}
+  /v1/health:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness and backend readiness (public).
+      description: |
+        KServe V2-style readiness rolled up across backends. `ok` when every backend is ok,
+        `degraded` when at least one (but not all) is down, `down` when none is usable.
+        Returns 200 for `ok` and `degraded`, 503 for `down`. No authentication.
+      security: []
+      responses:
+        "200":
+          description: Service is serving at least one backend.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    backends:
+                      text: {status: ok, latency_ms: 3}
+                      image: {status: ok, latency_ms: 2}
+        "503":
+          description: No backend is usable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                down:
+                  value:
+                    status: down
+                    backends:
+                      text: {status: down}
+                      image: {status: down}
+  /v1/models:
+    get:
+      tags: [ops]
+      operationId: listModels
+      summary: List served models (KServe V2-style model repository listing).
+      responses:
+        "200":
+          description: Served models.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+              examples:
+                current:
+                  summary: Built from api/fixtures/laya-models.json plus the pinned SigLIP2 commit
+                  value:
+                    models:
+                      - {id: laya-english, task: text-decision, backend: laya, version: laya-serve-0.4.20}
+                      - {id: laya-multilingual, task: text-decision, backend: laya, version: laya-serve-0.4.20}
+                      - {id: laya-typed-decisions, task: text-decision, backend: laya, version: laya-serve-0.4.20}
+                      - {id: siglip2-base-patch16-224, task: image-zero-shot, backend: siglip2, version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: "Static API key sent as `Authorization: Bearer <key>`."
+  responses:
+    InvalidRequest:
+      description: "`invalid_request` - malformed body, schema violation, unknown model pin, or a count limit exceeded."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: invalid_request, message: "questions: at most 32 questions are allowed"}
+    Unauthorized:
+      description: "`unauthorized` - missing or invalid bearer key."
+      headers:
+        WWW-Authenticate:
+          schema: {type: string, example: Bearer}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: unauthorized, message: missing or invalid API key}
+    PayloadTooLarge:
+      description: "`payload_too_large` - text state over 32 KiB or decoded image over 8 MiB."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: payload_too_large, message: decoded image is 9437184 bytes; limit is 8388608}
+    InternalError:
+      description: "`internal_error` - unexpected failure inside the proxy."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: internal_error, message: unexpected error}
+    BackendError:
+      description: "`backend_error` - the backend answered with an error or an unparseable response."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            model: laya-english
+            latency_ms: 41
+            error: {code: backend_error, message: "laya returned HTTP 500"}
+    BackendUnavailable:
+      description: "`backend_unavailable` - the backend is not reachable or not loaded."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: backend_unavailable, message: "text backend unreachable at 127.0.0.1:8000"}
+    BackendTimeout:
+      description: "`backend_timeout` - the backend did not answer within the proxy timeout."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: backend_timeout, message: image backend did not answer within 30000 ms}
+  schemas:
+    # ---------- envelope ----------
+    Envelope:
+      type: object
+      description: Common success wrapper. `results` is task-specific.
+      required: [model, model_version, latency_ms, results]
+      properties:
+        model:
+          type: string
+          description: Served model id (see `GET /v1/models`).
+        model_version:
+          type: string
+          description: Exact backend version (package version or model commit).
+        latency_ms:
+          type: number
+          minimum: 0
+          description: Wall time spent in the proxy for this request, in milliseconds.
+        results:
+          description: Task-specific results.
+        meta:
+          type: object
+          description: Optional backend-specific details (routing, usage, device).
+          additionalProperties: true
+        error:
+          $ref: "#/components/schemas/Error"
+    ErrorEnvelope:
+      type: object
+      description: Failure wrapper. `model` fields are present only once a model was resolved.
+      required: [error]
+      properties:
+        model: {type: string}
+        model_version: {type: string}
+        latency_ms: {type: number, minimum: 0}
+        meta: {type: object, additionalProperties: true}
+        error: {$ref: "#/components/schemas/Error"}
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [unauthorized, invalid_request, payload_too_large, backend_unavailable, backend_timeout, backend_error, internal_error]
+          description: |
+            `unauthorized`=401, `invalid_request`=400, `payload_too_large`=413,
+            `backend_unavailable`=503, `backend_timeout`=504, `backend_error`=502, `internal_error`=500.
+        message:
+          type: string
+          description: Human-readable explanation. Never contains secrets.
+    # ---------- text ----------
+    TextDecisionRequest:
+      type: object
+      required: [state, questions]
+      additionalProperties: false
+      properties:
+        state:
+          description: |
+            The thing to decide about: free text or a JSON object. Maximum 32 KiB (32768 bytes)
+            serialized as UTF-8 JSON; larger states are rejected with 413.
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 32768
+            - type: object
+        questions:
+          type: object
+          description: Question id -> question. 1 to 32 questions.
+          minProperties: 1
+          maxProperties: 32
+          propertyNames:
+            pattern: "^[A-Za-z0-9_.-]{1,64}$"
+          additionalProperties:
+            $ref: "#/components/schemas/Question"
+        model:
+          type: string
+          description: |
+            Optional Laya checkpoint pin: `english`, `multilingual`, or `typed-decisions`
+            (Laya aliases such as `en`, `multi`, `typed` are accepted). When omitted, Laya routes
+            automatically by script/language (see `meta.routing`). Unknown pins return 400.
+          examples: [english, multilingual, typed-decisions]
+        min_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: |
+            Optional threshold. Answers whose `confidence` is below it are still returned but
+            flagged with `low_confidence: true`.
+    Question:
+      oneOf:
+        - $ref: "#/components/schemas/ChoiceQuestion"
+        - $ref: "#/components/schemas/ScoreQuestion"
+        - $ref: "#/components/schemas/NoulQuestion"
+      discriminator:
+        propertyName: type
+        mapping:
+          choice: "#/components/schemas/ChoiceQuestion"
+          score: "#/components/schemas/ScoreQuestion"
+          noul: "#/components/schemas/NoulQuestion"
+    ChoiceQuestion:
+      type: object
+      description: Pick exactly one label.
+      required: [type, instructions, criteria]
+      properties:
+        type: {const: choice}
+        instructions: {type: string, minLength: 1, maxLength: 2048}
+        criteria:
+          type: object
+          description: Label -> description of when to choose it.
+          minProperties: 2
+          maxProperties: 64
+          additionalProperties: {type: string}
+    ScoreQuestion:
+      type: object
+      description: Ordinal scale; levels are indexed 0..n-1 in the order given.
+      required: [type, instructions, criteria]
+      properties:
+        type: {const: score}
+        instructions: {type: string, minLength: 1, maxLength: 2048}
+        criteria:
+          type: array
+          description: Level descriptions from lowest to highest.
+          minItems: 2
+          maxItems: 16
+          items: {type: string}
+    NoulQuestion:
+      type: object
+      description: Yes/no ("noul") question answered with a probability of "yes".
+      required: [type, instructions]
+      properties:
+        type: {const: noul}
+        instructions: {type: string, minLength: 1, maxLength: 2048}
+    TextDecisionEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: object
+              description: Question id -> answer (same keys as the request `questions`).
+              additionalProperties:
+                $ref: "#/components/schemas/TextAnswer"
+            meta:
+              type: object
+              properties:
+                backend_model:
+                  type: string
+                  description: Laya's own `model` field (e.g. `laya-rl-agent`).
+                usage: {$ref: "#/components/schemas/LayaUsage"}
+                routing: {$ref: "#/components/schemas/LayaRouting"}
+    TextAnswer:
+      oneOf:
+        - $ref: "#/components/schemas/ChoiceAnswer"
+        - $ref: "#/components/schemas/ScoreAnswer"
+        - $ref: "#/components/schemas/NoulAnswer"
+      discriminator:
+        propertyName: type
+        mapping:
+          choice: "#/components/schemas/ChoiceAnswer"
+          score: "#/components/schemas/ScoreAnswer"
+          noul: "#/components/schemas/NoulAnswer"
+    AnswerCommon:
+      type: object
+      properties:
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Laya's calibrated confidence in the answer as a whole.
+        answer_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Probability mass of the selected answer (choice/score) or of the answered side (noul).
+        action:
+          type: object
+          description: Laya action head output.
+          properties:
+            act_probability: {type: number, minimum: 0, maximum: 1}
+        low_confidence:
+          type: boolean
+          description: Present only when `min_confidence` was sent; true when `confidence < min_confidence`.
+    ChoiceAnswer:
+      allOf:
+        - $ref: "#/components/schemas/AnswerCommon"
+        - type: object
+          required: [type, choice, probabilities, confidence]
+          properties:
+            type: {const: choice}
+            choice: {type: string, description: Selected label from `criteria`.}
+            probabilities:
+              type: object
+              description: Label -> probability; sums to ~1.
+              additionalProperties: {type: number, minimum: 0, maximum: 1}
+    ScoreAnswer:
+      allOf:
+        - $ref: "#/components/schemas/AnswerCommon"
+        - type: object
+          required: [type, score, probabilities, confidence]
+          properties:
+            type: {const: score}
+            score:
+              type: number
+              minimum: 0
+              description: Expected level (probability-weighted mean of level indices, 0..n-1).
+            legend:
+              type: object
+              description: Level index (as string) -> level description from `criteria`.
+              additionalProperties: {type: string}
+            probabilities:
+              type: object
+              description: Level index (as string) -> probability; sums to ~1.
+              propertyNames: {pattern: "^[0-9]+$"}
+              additionalProperties: {type: number, minimum: 0, maximum: 1}
+    NoulAnswer:
+      allOf:
+        - $ref: "#/components/schemas/AnswerCommon"
+        - type: object
+          required: [type, noul]
+          properties:
+            type: {const: noul}
+            noul:
+              type: number
+              minimum: 0
+              maximum: 1
+              description: Probability that the answer is "yes".
+    LayaUsage:
+      type: object
+      description: Passed through from Laya `usage`.
+      properties:
+        input_tokens: {type: integer, minimum: 0}
+        output_tokens: {type: integer, minimum: 0}
+        state_tokens: {type: integer, minimum: 0}
+        state_tokens_dropped: {type: integer, minimum: 0}
+        truncated: {type: boolean}
+        truncated_questions:
+          type: array
+          items: {type: string}
+    LayaRouting:
+      type: object
+      description: |
+        Passed through from Laya `routing` (which checkpoint served the request and why).
+        The proxy removes `repo` (a local filesystem path).
+      properties:
+        model: {type: string, description: "Checkpoint actually used: english, multilingual, typed-decisions."}
+        reason: {type: string}
+        detection:
+          type: object
+          additionalProperties: true
+          properties:
+            script: {type: string}
+            script_profile:
+              type: object
+              additionalProperties: {type: number}
+            language: {type: [string, "null"]}
+            is_english: {type: boolean}
+            language_undecided: {type: boolean}
+            diacritic_rate: {type: number}
+            non_latin_fraction: {type: number}
+            mixed_segment: {}
+        workflow: {}
+    # ---------- image ----------
+    ImageClassifyRequest:
+      type: object
+      required: [image, candidate_labels]
+      additionalProperties: false
+      properties:
+        image:
+          type: object
+          required: [base64]
+          additionalProperties: false
+          properties:
+            base64:
+              type: string
+              contentEncoding: base64
+              minLength: 4
+              maxLength: 11184812
+              description: |
+                Standard base64 (no data: URL prefix) of the image bytes. Max 8 MiB (8388608 bytes)
+                after decoding, i.e. at most 11184812 base64 characters; larger images return 413.
+            media_type:
+              type: string
+              enum: [image/jpeg, image/png]
+              description: Optional hint; the proxy sniffs the bytes when omitted.
+        candidate_labels:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 256}
+        hypothesis_template:
+          type: string
+          default: a photo of a {}
+          pattern: "\\{\\}"
+          maxLength: 512
+          description: Prompt template; `{}` is replaced by each candidate label.
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 64
+          description: Return only the top k labels. Default is all candidate labels.
+        pad_to_square:
+          type: boolean
+          default: true
+          description: Pad (not crop) to a square before resizing to 224x224, so tall receipts are not cut off.
+    ImageClassifyEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            results:
+              type: array
+              description: Sorted by descending `score`.
+              items:
+                $ref: "#/components/schemas/LabelScore"
+    LabelScore:
+      type: object
+      required: [label, score]
+      properties:
+        label: {type: string}
+        score: {type: number, minimum: 0, maximum: 1}
+    # ---------- ops ----------
+    BackendHealth:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        latency_ms:
+          type: number
+          minimum: 0
+          description: Round-trip time of the backend health probe.
+    HealthResponse:
+      type: object
+      required: [status, backends]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        backends:
+          type: object
+          required: [text, image]
+          properties:
+            text: {$ref: "#/components/schemas/BackendHealth"}
+            image: {$ref: "#/components/schemas/BackendHealth"}
+    Model:
+      type: object
+      required: [id, task, backend, version]
+      properties:
+        id: {type: string}
+        task:
+          type: string
+          enum: [text-decision, image-zero-shot]
+        backend:
+          type: string
+          examples: [laya, siglip2]
+        version:
+          type: string
+          description: Backend package version or pinned model commit.
+    ModelList:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items: {$ref: "#/components/schemas/Model"}

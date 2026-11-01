@@ -1,0 +1,10 @@
+{"states": [
+  {"from": "user@acme.com", "subject": "Duplicate charge on invoice #4411", "body": "We were billed twice for March. Please refund it today or we will cancel."},
+  {"from": "ops@acme.com", "subject": "API returning 500s since 09:00", "body": "Production checkout is down for all customers. This is blocking us."},
+  {"from": "cto@globex.com", "subject": "Pricing for 500 seats", "body": "Could you send a quote for an enterprise contract with 500 seats?"}
+ ],
+ "questions": {
+  "department": {"type": "choice", "instructions": "Which department should handle this request?", "criteria": {"billing": "invoices, payments, refunds", "technical": "bugs, outages, system errors", "sales": "pricing, new contracts", "other": "everything else"}},
+  "urgency": {"type": "score", "instructions": "How urgent is this request?", "criteria": ["not urgent", "soon", "critical deadline or blocking issue"]},
+  "churn_risk": {"type": "noul", "instructions": "Does the user threaten to cancel or leave?"}
+ }}
