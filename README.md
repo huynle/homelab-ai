@@ -1,7 +1,8 @@
 # homelab-ai
 
-Homelab AI services. The main one is the **decision API**: a small authenticated HTTP API on the ml VM
-(`10.1.10.10`) for typed text decisions (Laya) and zero-shot image classification (SigLIP2).
+Homelab AI services. The main one is the **decision API**: a small authenticated HTTP API for typed
+text decisions (Laya) and zero-shot image classification (SigLIP2), served at
+**https://decide.ai.huynle.com**.
 
 | Route | Backend | Purpose |
 |---|---|---|
@@ -9,34 +10,51 @@ Homelab AI services. The main one is the **decision API**: a small authenticated
 | `POST /v1/classify/image` | SigLIP2 `siglip2-base-patch16-224` | pick among `candidate_labels` for an image |
 | `GET /v1/health` | both | readiness (no auth) |
 | `GET /v1/models` | both | served models |
+| `GET /healthz` | none | proxy liveness (no auth) |
 
-Everything binds to localhost on ml; clients reach it through an SSH tunnel.
+## Architecture
+
+```text
+client --HTTPS--> Traefik (k3s, wildcard TLS, rate limit) --> proxy pod (namespace decision-api)
+                                                                 |  API keys, limits, registry
+                                                                 v
+                                        ml VM 10.1.10.10: laya :8000, decision-image :8010 (GPU)
+```
+
+- **Proxy** ([`services/proxy`](services/proxy)): container image `ghcr.io/huynle/decision-api-proxy`,
+  built by CI on every push to `main` and promoted to k3s automatically by Flux image automation.
+- **Backends** ([`services/laya`](services/laya), [`services/image`](services/image)): systemd units on the
+  `ml` VM, pinned to the Tesla P40. They have no auth; the firewall on ml admits only the k3s node.
+- **Operations** live in the private `huynle/infra` repo: `apps/homelab/decision-api/` (HelmRelease,
+  ingress, backend registry, SOPS-encrypted API keys) and `hosts/ml/decision-api/` (systemd units, env
+  files, `deploy.sh`, `firewall.sh`). See the [runbook](docs/runbook.md).
 
 ## Docs
 
 - [`api/decision-api.yaml`](api/decision-api.yaml): OpenAPI 3.1 contract
 - [`api/README.md`](api/README.md): envelope, error codes, limits, fixtures
-- [`docs/runbook.md`](docs/runbook.md): start/stop, deploy, API keys, health checks, troubleshooting
+- [`docs/runbook.md`](docs/runbook.md): topology, deploys, adding models, API keys, health checks, troubleshooting, rollback
 - [`services/proxy/README.md`](services/proxy/README.md): the proxy (auth, limits, configuration)
 - [`services/image/README.md`](services/image/README.md): the SigLIP2 image backend
 
 ## Usage
 
-Open a tunnel from the laptop and keep it running:
-
 ```bash
-ssh -i ~/.ssh/id_vms -N -L 8080:127.0.0.1:8080 huy@10.1.10.10
-curl -s http://127.0.0.1:8080/v1/health
+export DECISION_API=https://decide.ai.huynle.com
+curl -s $DECISION_API/v1/health
 ```
 
-Every route except `/v1/health` needs `Authorization: Bearer <key>`. Get a key as described in the
-[runbook](docs/runbook.md#api-key-management) and put it in `DECISION_API_KEY` (for example from a
-password manager); do not hard-code it in scripts.
+Every route except `/v1/health` and `/healthz` needs `Authorization: Bearer <key>`. Get a key as
+described in the [runbook](docs/runbook.md#api-key-management) and put it in `DECISION_API_KEY` (for
+example from a password manager); do not hard-code it in scripts.
+
+On the LAN the name resolves through Pi-hole to the k3s node (`10.1.10.30`), so the same URL works at
+home and outside.
 
 ### Text decision
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/decide/text \
+curl -s $DECISION_API/v1/decide/text \
   -H "Authorization: Bearer $DECISION_API_KEY" \
   -H 'content-type: application/json' \
   -d '{
@@ -67,7 +85,7 @@ jq -n --rawfile b64 <(base64 -i photo.jpg | tr -d '\n') \
     candidate_labels: ["dog", "cat", "receipt"],
     top_k: 2}' > /tmp/classify.json
 
-curl -s http://127.0.0.1:8080/v1/classify/image \
+curl -s $DECISION_API/v1/classify/image \
   -H "Authorization: Bearer $DECISION_API_KEY" \
   -H 'content-type: application/json' \
   -d @/tmp/classify.json
@@ -87,6 +105,9 @@ print(json.dumps({"image": {"base64": b64, "media_type": "image/jpeg"},
 The response's `results` is `[{label, score}]`, highest score first. `pad_to_square` is off by default;
 padding makes scores for tall document images such as receipts less decisive, so send
 `"pad_to_square": true` only for images where squashing distorts the subject. Images
-are limited to 8 MiB after decoding. See the [runbook's known caveats](docs/runbook.md#known-caveats).
+are limited to 8 MiB after decoding.
+
+Typical latency through the public route from the LAN: text decisions about 0.16–0.26 s, image
+classification of a photo about 0.35 s. See the [runbook's known caveats](docs/runbook.md#known-caveats).
 
 Brain project: `homelab-ai`.

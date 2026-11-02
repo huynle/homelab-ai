@@ -1,11 +1,11 @@
 # Decision API v1
 
-`decision-api.yaml` (OpenAPI 3.1.0) is the contract for a small proxy on the `ml` VM. It sits in
-front of two local backends:
+`decision-api.yaml` (OpenAPI 3.1.0) is the contract for a small proxy served at
+`https://decide.ai.huynle.com` (k3s). It sits in front of two backends on the `ml` VM (`10.1.10.10`):
 
 | Route | Backend | Task |
 |---|---|---|
-| `POST /v1/decide/text` | Laya (`laya[serve]` 0.4.20, `127.0.0.1:8000/predict`) | typed text decisions: `choice`, `score`, `noul` |
+| `POST /v1/decide/text` | Laya (`laya[serve]` 0.4.20, `ml:8000/predict`) | typed text decisions: `choice`, `score`, `noul` |
 | `POST /v1/classify/image` | SigLIP2 `google/siglip2-base-patch16-224` @ `75de2d55` | zero-shot image classification |
 | `GET /v1/health` | every backend | readiness (public, no auth) |
 | `GET /v1/models` | registry | served models |

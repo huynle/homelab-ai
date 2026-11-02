@@ -1,296 +1,242 @@
-# Decision API runbook (ml VM)
+# Decision API runbook
 
-Operations guide for the decision API on the `ml` VM (`10.1.10.10`). The contract is
+Operations guide for the decision API at **https://decide.ai.huynle.com**. The contract is
 [`api/decision-api.yaml`](../api/decision-api.yaml); see [`api/README.md`](../api/README.md) for the
 envelope, error codes, and limits.
 
-SSH from the laptop (the `ml` host alias does not resolve, so use the IP):
+This repo holds the code. Deployment config lives in the private `huynle/infra` repo:
+
+| infra path | What |
+|---|---|
+| `apps/homelab/decision-api/release.yaml` | Namespace, HelmRelease (proxy Deployment, Service, NetworkPolicy, Traefik ingress) |
+| `apps/homelab/decision-api/registry.yaml` | Backend registry, generated as ConfigMap `decision-api-registry` |
+| `apps/homelab/decision-api/decision-api-keys.sops.yaml` | API keys (SOPS-encrypted Secret `decision-api-keys`) |
+| `apps/homelab/decision-api/image-policy.yaml` | Flux image repository/policy for the proxy image |
+| `hosts/ml/decision-api/` | systemd units, env files, `deploy.sh`, `firewall.sh` for the backends on ml |
+| `docs/decisions/0030-decision-api-public-api-key-route.md` | Why the API is public behind API keys |
+
+## Topology
+
+```text
+client --HTTPS--> Traefik on k3s (10.1.10.30) --> decision-api pod --> ml 10.1.10.10 :8000 (laya)
+                  wildcard TLS, public-chain       API keys, limits,       :8010 (decision-image)
+                  rate limit                       registry
+```
+
+| Part | Runs on | Managed by |
+|---|---|---|
+| Ingress `decide.ai.huynle.com` | Traefik on k3s, namespace `decision-api`, middleware `public-chain` (rate limit), wildcard TLS | infra `apps/homelab/decision-api/` |
+| Proxy ([`services/proxy`](../services/proxy)) | k3s Deployment `decision-api`, image `ghcr.io/huynle/decision-api-proxy` | CI in this repo + Flux image automation in infra |
+| Laya text backend ([`services/laya/serve_local.py`](../services/laya/serve_local.py)) | ml, systemd unit `laya`, port 8000 | infra `hosts/ml/decision-api/` |
+| SigLIP2 image backend ([`services/image`](../services/image)) | ml, systemd unit `decision-image`, port 8010 | infra `hosts/ml/decision-api/` |
+
+- `/healthz` and `/v1/health` need no key; every other route needs `Authorization: Bearer <key>`.
+- LAN clients resolve `decide.ai.huynle.com` through Pi-hole to `10.1.10.30`. The router does no
+  hairpin NAT, so a LAN client that resolves the name to the WAN IP will not connect.
+- The backends have no auth. ufw on ml admits only the k3s node (`10.1.10.30`, which pod egress is
+  SNATed to) on 8000/8010, and the NetworkPolicy lets only the proxy pod reach ml on those ports.
+- Both backends are pinned to the Tesla P40 by GPU UUID (see [GPU switching](#gpu-switching)).
+
+SSH to ml from the laptop (the `ml` alias does not resolve, so use the IP):
 
 ```bash
 ssh -i ~/.ssh/id_vms huy@10.1.10.10
 ```
 
-## Services
+## Deploy proxy changes
 
-All three services bind to localhost only and run in tmux sessions. **Nothing is under systemd: a
-reboot stops all of them.** After a reboot, start them again as shown below.
+1. Merge a PR to `main` that touches `services/proxy/**`.
+2. [`.github/workflows/proxy-image.yml`](../.github/workflows/proxy-image.yml) tests the proxy and pushes
+   `ghcr.io/huynle/decision-api-proxy:git-<UTC timestamp>-<12-char sha>`.
+3. Flux image automation in infra picks the newest tag (checked every 5 minutes), commits the new tag
+   and digest into `apps/homelab/decision-api/release.yaml`, and the HelmRelease rolls the pod.
+4. Check: `curl -s https://decide.ai.huynle.com/v1/health` and the [smoke tests](#health-checks-and-smoke-tests).
 
-| tmux session | Service | Bind | Python / venv | Log |
-|---|---|---|---|---|
-| `laya-test` | Laya text backend (`~/laya-test/serve_local.py`) | `127.0.0.1:8000` | `~/laya-test/.venv` | `~/laya-test/server.log` |
-| `decision-image` | SigLIP2 image backend (`services/image/app.py`) | `127.0.0.1:8010` | `~/image-test/.venv` | `~/decision-api/image.log` |
-| `decision-proxy` | Decision API proxy (`services/proxy/app.py`) | `127.0.0.1:8080` | `~/decision-api/.venv-proxy` | `~/decision-api/proxy.log` |
+No manual step is needed. To see where it is: `flux get image policy -n flux-system` and
+`kubectl -n decision-api get deploy decision-api -o jsonpath='{.spec.template.spec.containers[0].image}'`.
 
-Files on ml:
+## Deploy backend changes
 
-| Path | Purpose |
-|---|---|
-| `~/decision-api/services/`, `~/decision-api/api/` | Deployed code (rsynced from this repo) |
-| `~/decision-api/DEPLOYED_COMMIT` | Commit hash that is deployed |
-| `~/decision-api/RUNNING.md` | Start/stop notes kept on the VM |
-| `~/decision-api/keys` | API keys, mode 600. Never print or commit it |
-| `~/decision-api/test-data/` | Latency/accuracy test script and results |
-
-The proxy only calls the backends per request, so its start order does not matter for correctness,
-but `/v1/health` reports `backend_unavailable` until both backends are up.
-
-## Start, stop, restart
-
-Run these on ml. The commands match `~/decision-api/RUNNING.md` (and, for Laya, the command its
-running tmux session was started with).
-
-### Laya text backend (`laya-test`)
-
-The Laya session predates this deployment and is shared with other Laya testing. Only restart it
-when it is actually down.
+Backends run from a pinned commit of this repo, checked out in `~/homelab-ai` on ml. From the infra
+repo root on the laptop:
 
 ```bash
-# start
-tmux new-session -d -s laya-test "cd ~/laya-test && LAYA_CUDA_AMP=fp32 HF_HUB_OFFLINE=1 PORT=8000 .venv/bin/python -I serve_local.py > ~/laya-test/server.log 2>&1"
-until curl -sf 127.0.0.1:8000/health; do sleep 2; done
-
-# stop
-tmux kill-session -t laya-test
+hosts/ml/decision-api/deploy.sh --dry-run <full 40-char homelab-ai sha>   # review
+hosts/ml/decision-api/deploy.sh <full 40-char homelab-ai sha>
 ```
 
-Note that this start command truncates `server.log` (`>`), so copy the log first if you need it.
+`deploy.sh` checks out the sha (detached HEAD), installs `laya.service` / `decision-image.service` and the
+env files in `/etc/decision-api/`, restarts only units whose code, unit, or env changed, and waits for
+`/health` on both ports. Update the pinned sha in the script header (and the infra changelog) in the same
+infra PR. Dependencies are not installed by `deploy.sh`: if `services/image/requirements.txt` changed,
+install it into the image venv on ml first, and check `df -h /` before anything large.
 
-### Image backend (`decision-image`)
+ml runs **Python 3.10**. CI tests the proxy and image server on 3.10 and 3.12; avoid 3.11+ APIs (for
+example `tomllib`, `typing.Self`, `except*`, `datetime.UTC`, `binascii.a2b_base64(strict_mode=...)`) in
+backend code. A unit that exits right after start usually shows an `AttributeError` or `ImportError` in
+`journalctl -u <unit>`.
 
-```bash
-# start
-tmux new-session -d -s decision-image "cd ~/decision-api/services/image && HOST=127.0.0.1 PORT=8010 HF_HOME=$HOME/image-test/models/hf-home HF_HUB_OFFLINE=1 exec $HOME/image-test/.venv/bin/python app.py >> $HOME/decision-api/image.log 2>&1"
-until curl -sf 127.0.0.1:8010/health; do sleep 2; done   # model load ~10 s
+## Add a model
 
-# stop (frees ~1 GB GPU memory)
-tmux kill-session -t decision-image
-```
-
-The server only accepts connections once the model has loaded, so "connection refused" right after
-start means it is still loading.
-
-### Proxy (`decision-proxy`)
-
-```bash
-# start
-tmux new-session -d -s decision-proxy "cd ~/decision-api/services/proxy && HOST=127.0.0.1 PORT=8080 DECISION_API_KEYS_FILE=$HOME/decision-api/keys TEXT_BACKEND_URL=http://127.0.0.1:8000 IMAGE_BACKEND_URL=http://127.0.0.1:8010 exec $HOME/decision-api/.venv-proxy/bin/python app.py >> $HOME/decision-api/proxy.log 2>&1"
-curl -s 127.0.0.1:8080/v1/health
-
-# stop
-tmux kill-session -t decision-proxy
-```
-
-### Restart
-
-A restart is stop then start. For example, to restart the proxy:
-
-```bash
-tmux kill-session -t decision-proxy
-tmux new-session -d -s decision-proxy "cd ~/decision-api/services/proxy && HOST=127.0.0.1 PORT=8080 DECISION_API_KEYS_FILE=$HOME/decision-api/keys TEXT_BACKEND_URL=http://127.0.0.1:8000 IMAGE_BACKEND_URL=http://127.0.0.1:8010 exec $HOME/decision-api/.venv-proxy/bin/python app.py >> $HOME/decision-api/proxy.log 2>&1"
-curl -s 127.0.0.1:8080/v1/health
-```
-
-Check which sessions are running with `tmux ls`.
-
-## Deploy or update
-
-Run from the laptop, in the checkout or worktree you want to deploy. Commit first so that
-`DEPLOYED_COMMIT` names a real commit.
-
-```bash
-# 1. copy code (no caches or local venvs)
-rsync -av -e "ssh -i ~/.ssh/id_vms" \
-  --exclude __pycache__ --exclude .pytest_cache --exclude .ruff_cache --exclude .venv \
-  api services huy@10.1.10.10:~/decision-api/
-
-# 2. record the deployed commit
-git rev-parse HEAD | ssh -i ~/.ssh/id_vms huy@10.1.10.10 'cat > ~/decision-api/DEPLOYED_COMMIT'
-```
-
-3. If `services/proxy/requirements.txt` or `services/image/requirements.txt` changed, install into
-   the matching venv on ml first (`~/decision-api/.venv-proxy/bin/pip install -r
-   ~/decision-api/services/proxy/requirements.txt`, or `~/image-test/.venv/bin/pip install -r
-   ~/decision-api/services/image/requirements.txt`). The disk is about 90% full, so check
-   `df -h /` before installing anything large.
-4. On ml, restart the sessions whose code changed (`decision-image` and/or `decision-proxy`, see
-   [Restart](#restart)). Laya is not deployed from this repo.
-5. Run the health check:
-
-   ```bash
-   ssh -i ~/.ssh/id_vms huy@10.1.10.10 'curl -s 127.0.0.1:8080/v1/health'
-   ```
-
-   Expect `"status":"ok"` for both backends, then run the [smoke tests](#health-checks-and-smoke-tests).
-
-ml runs **Python 3.10**. Before deploying, make sure the code does not use 3.11+ APIs (see
-[Troubleshooting](#python-310-compatibility)).
+1. Start a backend on ml (or another host) and check `curl -s 127.0.0.1:<port>/health` there. For a
+   permanent backend, add a unit and env file under infra `hosts/ml/decision-api/` and deploy it.
+2. If it listens on a new port, open it for `10.1.10.30` only (extend `firewall.sh`) and allow it in the
+   NetworkPolicy egress in `release.yaml`.
+3. Add an entry to infra `apps/homelab/decision-api/registry.yaml` (schema:
+   [proxy README](../services/proxy/README.md#backend-registry)). An existing adapter needs no code change;
+   a new kind of backend needs a new adapter in `services/proxy/adapters.py` first.
+4. Merge the infra PR, then restart the proxy (the ConfigMap has no hash suffix, so it does not roll the
+   pod by itself): `kubectl -n decision-api rollout restart deploy/decision-api`, run through the infra
+   GitOps workflow.
+5. `GET /v1/models` lists the new id and `GET /v1/health` reports it under `models`.
 
 ## API key management
 
-Keys live in `~/decision-api/keys` on ml: one key per line, `#` starts a comment, mode `600`. The
-proxy reads the file at startup, so every change needs a proxy restart. The proxy refuses to start
-with no keys and logs a warning if the file is readable by group or others.
+Keys are lines in the SOPS-encrypted Secret `decision-api-keys` in infra
+`apps/homelab/decision-api/decision-api-keys.sops.yaml`: one key per line, `#` starts a comment, keys
+must not contain `#`. The proxy reads them once at startup. A self-service admin page is planned but
+not built yet.
 
-**Never commit keys, paste them into Brain, or echo them in a shared terminal.** The repo's
-`.gitignore` excludes `*.key` and `.env`, but the key file is not in the repo at all; keep it that
-way.
+**Never commit plaintext keys, paste them into Brain or chat, or echo them in a shared terminal.**
 
 ### Create a key
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'   # copy into a password manager
+sops apps/homelab/decision-api/decision-api-keys.sops.yaml       # add "# <caller>, <date>" and the key
+```
+
+Open a PR in infra, merge it, wait for Flux to apply the Secret, then restart the proxy
+(`kubectl -n decision-api rollout restart deploy/decision-api`). Hand the key to the caller over a
+private channel.
+
+### Rotate a key
+
+1. Add the new key next to the old one, merge, restart. Both keys now work.
+2. Move the caller to the new key and confirm its requests succeed (the access log's `key_id` is the
+   first 8 hex characters of the key's sha256).
+3. Delete the old line, merge, restart.
+
+### Revoke a key
+
+Delete its line, merge, restart.
+
+## Health checks and smoke tests
+
+Public (no key):
+
+```bash
+curl -s https://decide.ai.huynle.com/healthz
+curl -s https://decide.ai.huynle.com/v1/health
+# {"status":"ok","backends":{"text":{"status":"ok",...},"image":{"status":"ok",...}},"models":{...}}
+```
+
+Authenticated, from a checkout of this repo, with the key in `DECISION_API_KEY`:
+
+```bash
+API=https://decide.ai.huynle.com
+curl -s -H "Authorization: Bearer $DECISION_API_KEY" $API/v1/models
+curl -s -H "Authorization: Bearer $DECISION_API_KEY" -H 'content-type: application/json' \
+  -d @api/fixtures/laya-predict.request.json $API/v1/decide/text
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/v1/decide/text   # expect 401
+```
+
+The image example is in the [README](../README.md#image-classification).
 
 On ml:
 
 ```bash
-umask 077
-{ echo "# <caller name>, $(date +%F)"; python3 -c 'import secrets; print(secrets.token_urlsafe(32))'; } >> ~/decision-api/keys
-chmod 600 ~/decision-api/keys
+systemctl status laya decision-image
+journalctl -u laya -u decision-image --since '1 hour ago'
+curl -s 127.0.0.1:8000/health    # Laya
+curl -s 127.0.0.1:8010/health    # image (model load takes ~10 s after a restart)
+nvidia-smi
 ```
 
-Then restart the proxy. Hand the key to the caller over a private channel (for example, copy it with
-`tail -1 ~/decision-api/keys` into a password manager, not into chat or logs). Keys must not contain
-`#`.
-
-### Rotate a key
-
-1. Add the new key line (as in [Create a key](#create-a-key)) and keep the old one.
-2. Restart the proxy. Both keys now work.
-3. Move the caller to the new key and confirm its requests succeed.
-4. Delete the old key's line (and its comment) from `~/decision-api/keys`, check
-   `stat -c %a ~/decision-api/keys` still prints `600`, and restart the proxy again.
-
-### Revoke a key
-
-Delete its line and restart the proxy.
-
-## Health checks and smoke tests
-
-`GET /v1/health` is public (no key needed):
+Proxy, on k3s:
 
 ```bash
-curl -s 127.0.0.1:8080/v1/health
-# {"status":"ok","backends":{"text":{"status":"ok","latency_ms":22.7},"image":{"status":"ok","latency_ms":21.4}}}
+kubectl -n decision-api get pods
+kubectl -n decision-api logs deploy/decision-api   # one JSON access line per request; no bodies or keys
 ```
 
-Backends directly: `curl -s 127.0.0.1:8000/health` (Laya), `curl -s 127.0.0.1:8010/health` (image).
+Measured through the public route from the LAN (2026-11-02):
 
-Authenticated smoke tests, on ml. The key is read into a variable and never echoed:
-
-```bash
-KEY=$(head -1 ~/decision-api/keys)   # line 1 is a key; new keys are appended below it
-cd ~/decision-api
-
-# models
-curl -s -H "Authorization: Bearer $KEY" 127.0.0.1:8080/v1/models
-
-# text decision (real fixture payload)
-curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d @api/fixtures/laya-predict.request.json 127.0.0.1:8080/v1/decide/text
-
-# image classification (receipt test image)
-python3 - <<'EOF' > /tmp/classify.json
-import base64, json
-b64 = base64.b64encode(open("test-data/receipts-left-shell.jpg", "rb").read()).decode()
-print(json.dumps({"image": {"base64": b64, "media_type": "image/jpeg"},
-                  "candidate_labels": ["receipt", "dog", "cat", "document"]}))
-EOF
-curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d @/tmp/classify.json 127.0.0.1:8080/v1/classify/image
-rm /tmp/classify.json
-
-# auth is enforced: expect 401
-curl -s -o /dev/null -w '%{http_code}\n' -X POST 127.0.0.1:8080/v1/decide/text
-```
-
-`~/decision-api/test-data/decision_tests.py` is the fuller latency/accuracy test; its last results are
-in `test-data/results.json`. Measured through the proxy on ml (20 calls after 3 warm-ups):
-
-| Route | Median | p95 |
-|---|---|---|
-| `POST /v1/decide/text` | 212 ms | 285 ms |
-| `POST /v1/classify/image` (dog image) | 243 ms | 292 ms |
-
-### From the laptop
-
-The proxy is localhost-only, so reach it through an SSH tunnel:
-
-```bash
-ssh -i ~/.ssh/id_vms -N -L 8080:127.0.0.1:8080 huy@10.1.10.10
-# in another terminal
-curl -s http://127.0.0.1:8080/v1/health
-```
-
-Client examples are in the [README](../README.md#usage).
-
-## Logs
-
-| Service | Log |
+| Route | Latency |
 |---|---|
-| Proxy | `~/decision-api/proxy.log` (one JSON access line per request: method, path, status, latency, key id; no bodies or keys) |
-| Image | `~/decision-api/image.log` (label count, image size, latency; no image bytes) |
-| Laya | `~/laya-test/server.log` |
+| `POST /v1/decide/text` | ~0.16–0.26 s |
+| `POST /v1/classify/image` (dog photo) | ~0.35 s |
 
-```bash
-tail -f ~/decision-api/proxy.log
-tmux attach -t decision-proxy   # detach with Ctrl-b d; do not Ctrl-c, that stops the service
-```
+## GPU switching
+
+Both units pin a GPU in their env file with `CUDA_DEVICE_ORDER=PCI_BUS_ID` and
+`CUDA_VISIBLE_DEVICES=<GPU UUID>` (the Tesla P40 today). The GTX 1070 is free. To move a backend, set
+its `CUDA_VISIBLE_DEVICES` in infra `hosts/ml/decision-api/<unit>.env` to the 1070's UUID (noted in the
+file; `nvidia-smi -L` lists them), merge, and re-run `deploy.sh` with the current pin; it restarts the
+unit because the env file changed.
 
 ## Troubleshooting
-
-### `503 backend_unavailable`
-
-The proxy could not connect to a backend. `curl -s 127.0.0.1:8080/v1/health` shows which one.
-
-- Check `tmux ls`. If `laya-test` or `decision-image` is missing (for example after a reboot),
-  start it.
-- If the session exists but the port refuses connections, the image backend may still be loading
-  (~10 s), or it crashed: read the end of its log. A CUDA out-of-memory error means something else
-  is using the GPU (`nvidia-smi`).
-- `504 backend_timeout` means the backend accepted the request but took longer than
-  `TEXT_TIMEOUT_S` / `IMAGE_TIMEOUT_S` (10 s default). `502 backend_error` means it answered with
-  an error; check its log.
 
 ### `401 unauthorized`
 
 - The header must be exactly `Authorization: Bearer <key>`.
-- The key must be a line in `~/decision-api/keys` **and** the proxy must have been restarted after
-  it was added. Keys are read only at startup.
-- Watch for stray whitespace or a trailing newline when the key was copied, and make sure
-  `head -1` did not pick up a `#` comment line.
+- The key must be in the Secret **and** the pod must have been restarted after the Secret changed.
+- Watch for stray whitespace or a trailing newline from copying the key.
 
 ### `413 payload_too_large`
 
-- Text: `state` is over 32 KiB as UTF-8 JSON. Trim the text or send less of it.
-- Image: over 8 MiB after base64 decoding. Downscale or re-encode the image (JPEG) before sending.
+- Text: `state` is over 32 KiB as UTF-8 JSON, or the body is over 64 KiB.
+- Image: over 8 MiB after base64 decoding (or the body over 12 MiB). Downscale or re-encode as JPEG.
 - Too many questions (over 32) or labels (over 64) return `400 invalid_request`, not 413.
 
-### Tunnel does not work
+### `503 backend_unavailable`
 
-- `bind: Address already in use`: something on the laptop already uses port 8080. Use another
-  local port (`-L 18080:127.0.0.1:8080`, then `http://127.0.0.1:18080`) or stop the other process
-  (`lsof -i :8080`).
-- `Permission denied (publickey)`: pass `-i ~/.ssh/id_vms` and use `huy@10.1.10.10`, not the `ml`
-  alias.
-- `channel ... open failed: connect failed: Connection refused` in the tunnel terminal: the tunnel is
-  fine, but the proxy is not running on ml. Start `decision-proxy`.
-- The connection hangs: check the VM is up (`ping 10.1.10.10`).
+The proxy could not connect to a backend; `/v1/health` shows which one.
 
-### Python 3.10 compatibility
+1. On ml: `systemctl status laya decision-image` and `curl 127.0.0.1:8000/health` / `:8010/health`.
+   If a unit is failed, read `journalctl -u <unit>`. A CUDA out-of-memory error means something else is
+   using the GPU (`nvidia-smi`).
+2. Firewall: `sudo ufw status` on ml must allow `10.1.10.30` on 8000,8010 (re-apply with infra
+   `hosts/ml/decision-api/firewall.sh`).
+3. NetworkPolicy: the pod's egress to `10.1.10.10/32` on 8000/8010 must still be allowed in
+   `release.yaml`.
 
-ml runs Python 3.10. Code that passes tests on the laptop (3.13) can still fail on ml. An earlier
-proxy build used `binascii.a2b_base64(..., strict_mode=True)` (3.11+) and broke on deploy; commit
-`08d77eb` replaced it with `base64.b64decode(..., validate=True)`. Before
-deploying, avoid 3.11+ features (for example `tomllib`, `typing.Self`, `ExceptionGroup`/`except*`,
-`datetime.UTC`) or check them with `python3.10`. If a service exits right after start, read its log
-for an `AttributeError` or `ImportError`.
+`504 backend_timeout` means the backend accepted the request but took longer than the entry's
+`timeout_s` (10 s). `502 backend_error` means it answered with an error; check its journal.
+
+### Cannot connect at all
+
+- From the LAN, `dig +short decide.ai.huynle.com` must return `10.1.10.30` (Pi-hole). If it returns the
+  WAN IP, the connection fails because there is no hairpin NAT; fix the Pi-hole record or the client's
+  DNS.
+- `429`: the Traefik `public-chain` rate limit; back off.
+- Check the pod and ingress: `kubectl -n decision-api get pods,ingress`.
+
+## Rollback
+
+- **Proxy, registry, keys, ingress:** revert the change in infra (PR, merge) and restart the pod if the
+  registry or keys changed. A reverted image tag is re-promoted by Flux image automation to the newest
+  image, so for a bad proxy build either revert the commit in this repo (CI builds a fixed image) or
+  pause image automation for it first (see infra `docs/image-automation.md`) and then pin the previous tag.
+- **Backends:** re-run `hosts/ml/decision-api/deploy.sh <previous sha>` and restore the previous pin in
+  the script header.
 
 ## Known caveats
 
-- **`pad_to_square` is off by default.** Padding keeps the aspect ratio, but it makes scores for
-  tall images such as receipts less decisive. On the left Shell receipt crop, the `fuel receipt`
-  label scored 0.993 unpadded and 0.432 padded; the dog image was unaffected. Send `"pad_to_square": true` only
-  for images where squashing distorts the subject.
+- **`pad_to_square` is off by default.** Padding keeps the aspect ratio, but it makes scores for tall
+  images such as receipts less decisive. On the left Shell receipt crop, the `fuel receipt` label scored
+  0.993 unpadded and 0.432 padded; the dog image was unaffected. Send `"pad_to_square": true` only for
+  images where squashing distorts the subject.
 - **Laya confidence is uncalibrated.** The English Laya checkpoint's `confidence` values are not
-  calibrated probabilities. Treat `min_confidence` thresholds as tuning knobs and check them against
-  real data.
-- **Not persistent.** Services run in tmux, not systemd, and stop on reboot.
-- **Disk is about 90% full** on ml (`df -h /`). Clean up before downloading models or installing
-  large packages.
+  calibrated probabilities. Treat `min_confidence` thresholds as tuning knobs and check them against real
+  data.
+- **Python 3.10 on ml.** See [Deploy backend changes](#deploy-backend-changes).
+- **Disk on ml is tight** (it was about 90% full). Check `df -h /` before downloading models or
+  installing large packages.
+
+## Retired
+
+Until 2026-11-02 everything ran in tmux sessions on ml: the proxy on `127.0.0.1:8080` with keys in
+`~/decision-api/keys`, and clients used an SSH tunnel (`ssh -N -L 8080:...`). That proxy, its key file,
+and the tunnel path are retired; do not use them. `~/decision-api` on ml is kept as rollback material
+until 2026-11-16 and can be deleted after that.

@@ -11,6 +11,15 @@ model backends listed in its [backend registry](#backend-registry):
 | `GET /v1/models` | the registry entries |
 | `GET /healthz` | none: process liveness for Kubernetes (public, no auth, not access-logged) |
 
+## Production
+
+Production runs this proxy on k3s behind `https://decide.ai.huynle.com` (namespace `decision-api`).
+CI ([`.github/workflows/proxy-image.yml`](../../.github/workflows/proxy-image.yml)) publishes
+`ghcr.io/huynle/decision-api-proxy` on every push to `main` that touches `services/proxy/**`, and Flux
+image automation in `huynle/infra` (`apps/homelab/decision-api/`) promotes it. The registry and the API
+keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
+`kubectl -n decision-api rollout restart deploy/decision-api`. Operations: [runbook](../../docs/runbook.md).
+
 ## Files
 
 - `app.py`: `create_app()` (routes, auth, body limits, model resolution, health, access log) and `main()`
@@ -97,13 +106,18 @@ Routing:
 
 1. Start the backend on `ml` and check `GET {backend_url}/health`.
 2. Add an entry to the registry file. A model served by an existing adapter needs no code change.
-3. Restart the proxy (in k3s: roll out the new ConfigMap). `GET /v1/models` lists it and
+3. Restart the proxy. In production the registry is infra `apps/homelab/decision-api/registry.yaml`;
+   after merging, run `kubectl -n decision-api rollout restart deploy/decision-api` (see the
+   [runbook](../../docs/runbook.md#add-a-model)). `GET /v1/models` lists it and
    `GET /v1/health` reports it under `models`.
 
 A new kind of backend needs a new adapter: one class in `adapters.py` with a `task` and an async `run()`
 that calls the backend and returns a `Result`, registered in `ADAPTERS` under the key used in `adapter:`.
 
 ## API keys
+
+In production keys come from the SOPS Secret in infra (see the
+[runbook](../../docs/runbook.md#api-key-management)). For a local run:
 
 ```bash
 install -d -m 700 /etc/decision-api
