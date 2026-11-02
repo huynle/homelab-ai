@@ -115,3 +115,38 @@ def client(settings, backends):
 @pytest.fixture
 def auth() -> dict:
     return {"Authorization": f"Bearer {API_KEY}"}
+
+
+class FakeMetricsServer:
+    def __init__(self):
+        self.stopped = False
+
+    def shutdown(self):
+        self.stopped = True
+
+    def server_close(self):
+        pass
+
+
+class MetricsServers:
+    """Records start_metrics_server calls instead of binding a real port."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.servers: list[FakeMetricsServer] = []
+
+    def start(self, **kwargs):
+        self.calls.append(kwargs)
+        server = FakeMetricsServer()
+        self.servers.append(server)
+        return server
+
+
+@pytest.fixture(autouse=True)
+def metrics_servers(monkeypatch) -> MetricsServers:
+    """No test binds the metrics port; tests that need a real server call the original function directly."""
+    import metrics
+
+    fake = MetricsServers()
+    monkeypatch.setattr(metrics, "start_metrics_server", fake.start)
+    return fake
