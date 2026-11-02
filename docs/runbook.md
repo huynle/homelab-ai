@@ -190,8 +190,7 @@ python3 - <<'EOF' > /tmp/classify.json
 import base64, json
 b64 = base64.b64encode(open("test-data/receipts-left-shell.jpg", "rb").read()).decode()
 print(json.dumps({"image": {"base64": b64, "media_type": "image/jpeg"},
-                  "candidate_labels": ["receipt", "dog", "cat", "document"],
-                  "pad_to_square": False}))
+                  "candidate_labels": ["receipt", "dog", "cat", "document"]}))
 EOF
 curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d @/tmp/classify.json 127.0.0.1:8080/v1/classify/image
@@ -285,9 +284,10 @@ for an `AttributeError` or `ImportError`.
 
 ## Known caveats
 
-- **`pad_to_square` defaults to `true`.** Padding keeps the aspect ratio, but it makes scores for
+- **`pad_to_square` is off by default.** Padding keeps the aspect ratio, but it makes scores for
   tall images such as receipts less decisive. On the left Shell crop fuel receipt, `receipt` scored
-  0.993 unpadded and 0.432 padded. Send `"pad_to_square": false` for tall document images.
+  0.993 unpadded and 0.432 padded; the dog image was unaffected. Send `"pad_to_square": true` only
+  for images where squashing distorts the subject.
 - **Laya confidence is uncalibrated.** The English Laya checkpoint's `confidence` values are not
   calibrated probabilities. Treat `min_confidence` thresholds as tuning knobs and check them against
   real data.

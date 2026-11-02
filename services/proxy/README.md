@@ -81,6 +81,7 @@ curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   false otherwise. An answer without a numeric `confidence` is flagged as low.
 - **Image.** The request body goes to the backend unchanged. In the response, `results` passes through, and
   the backend's `latency_ms` becomes `meta.backend_latency_ms`, next to `meta.hypothesis_template`,
+  `meta.pad_to_square` (the effective value; default false),
   `meta.backend_model`, and any `meta`/`device` the backend returns. `latency_ms` is the proxy's total time.
 - **Limits.** These checks run before any backend call:
   - Body cap before JSON parsing: 64 KiB for text and 12 MiB for image. Over the cap returns 413.

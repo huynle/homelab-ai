@@ -173,6 +173,21 @@ def test_image_default_template_reported_in_meta(client, auth, image_request):
     assert body["meta"]["hypothesis_template"] == "a photo of a {}"
 
 
+def test_image_pad_to_square_default_reported_in_meta_and_not_injected(client, auth, image_request, backends):
+    body = client.post(IMAGE, json=image_request, headers=auth).json()
+    assert body["meta"]["pad_to_square"] is False
+    (sent,) = backends.requests
+    assert "pad_to_square" not in json.loads(sent.content)
+
+
+def test_image_pad_to_square_true_forwarded_and_reported(client, auth, image_request, backends):
+    image_request["pad_to_square"] = True
+    body = client.post(IMAGE, json=image_request, headers=auth).json()
+    assert body["meta"]["pad_to_square"] is True
+    (sent,) = backends.requests
+    assert json.loads(sent.content)["pad_to_square"] is True
+
+
 def test_image_more_than_64_labels_is_400(client, auth, image_request, backends):
     image_request["candidate_labels"] = [f"label {i}" for i in range(65)]
     body = assert_error(client.post(IMAGE, json=image_request, headers=auth), 400, "invalid_request")

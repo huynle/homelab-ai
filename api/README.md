@@ -38,6 +38,8 @@ Success responses use one shape:
 - `meta` carries backend details. For text these are Laya's `routing` (which checkpoint served the
   request and why), `usage`, and Laya's own `model` name as `meta.backend_model`. The proxy removes
   `routing.repo` because it is a local filesystem path.
+  For images, `meta.hypothesis_template` and `meta.pad_to_square` report the effective values,
+  including defaults (`pad_to_square` is off unless the client sends `true`).
 
 Failures return `{"error": {"code", "message"}}`. The `model` fields appear only once a model has
 been resolved. Each code maps to one HTTP status:

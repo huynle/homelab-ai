@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from config import Settings
 from errors import ApiError, error_response
 from models import (
+    DEFAULT_PAD_TO_SQUARE,
     DEFAULT_TEMPLATE,
     MAX_IMAGE_B64_CHARS,
     MAX_IMAGE_BYTES,
@@ -348,6 +349,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if "device" in backend:
             meta.setdefault("device", backend["device"])
         meta["hypothesis_template"] = req.hypothesis_template or DEFAULT_TEMPLATE
+        meta["pad_to_square"] = DEFAULT_PAD_TO_SQUARE if req.pad_to_square is None else req.pad_to_square
         if "latency_ms" in backend:
             meta["backend_latency_ms"] = backend["latency_ms"]
         if "model" in backend:

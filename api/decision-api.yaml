@@ -198,6 +198,7 @@ paths:
                       - {label: wolf, score: 0.0002}
                     meta:
                       hypothesis_template: a photo of a {}
+                      pad_to_square: false
                       device: cuda
         "400": {$ref: "#/components/responses/InvalidRequest"}
         "401": {$ref: "#/components/responses/Unauthorized"}
@@ -628,8 +629,11 @@ components:
           description: Return only the top k labels. Default is all candidate labels.
         pad_to_square:
           type: boolean
-          default: true
-          description: Pad (not crop) to a square before resizing to 224x224, so tall receipts are not cut off.
+          default: false
+          description: >-
+            Pad (not crop) the image onto a white square before resizing to 224x224. Padding keeps the
+            aspect ratio, but it spreads probability on tall document images such as receipts, so it is
+            off by default. Turn it on for images where squashing distorts the subject.
     ImageClassifyEnvelope:
       allOf:
         - $ref: "#/components/schemas/Envelope"

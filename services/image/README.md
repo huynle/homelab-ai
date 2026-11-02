@@ -14,7 +14,7 @@ listens on `127.0.0.1:8010` by default. It does no authentication; only the prox
  "candidate_labels": ["dog", "cat", "receipt"],
  "hypothesis_template": "a photo of a {}",
  "top_k": 2,
- "pad_to_square": true}
+ "pad_to_square": false}
 ```
 
 The fields, defaults, and limits match the contract's `ImageClassifyRequest`: 1 to 64 unique
@@ -48,9 +48,11 @@ Errors use the contract's shape, `{"error": {"code", "message"}}`:
 
 ## Behaviour
 
-- **Padding.** With `pad_to_square` (the default), the image is centred on a white square before
-  the processor runs. The processor resizes straight to 224x224 and ignores the aspect ratio, so
-  without padding tall receipts get squashed. Transparent images are composited onto white.
+- **Padding.** `pad_to_square` is off by default. The processor resizes straight to 224x224 and
+  ignores the aspect ratio, so tall images get squashed. With `"pad_to_square": true`, the image is
+  centred on a white square first, which keeps the aspect ratio but spreads probability on tall
+  document images such as receipts. Turn it on for images where squashing distorts the subject.
+  Transparent images are composited onto white.
 - **Text cache.** Text embeddings are cached in an LRU keyed by `(template, labels)` with 64
   entries by default. Repeating a label set costs one image forward pass.
 - **Inference.** Forward passes are serialized with a lock. FastAPI runs the sync handler in its

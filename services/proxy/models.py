@@ -12,6 +12,7 @@ MAX_LABELS = 64
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_B64_CHARS = 11184812
 DEFAULT_TEMPLATE = "a photo of a {}"
+DEFAULT_PAD_TO_SQUARE = False  # matches the image backend default
 
 Instructions = Annotated[str, StringConstraints(min_length=1, max_length=2048)]
 QuestionId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,64}$")]

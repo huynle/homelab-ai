@@ -84,8 +84,9 @@ print(json.dumps({"image": {"base64": b64, "media_type": "image/jpeg"},
 ' photo.jpg > /tmp/classify.json
 ```
 
-The response's `results` is `[{label, score}]`, highest score first. For tall document images such as
-receipts, add `"pad_to_square": false`; padding (the default) makes their scores less decisive. Images
+The response's `results` is `[{label, score}]`, highest score first. `pad_to_square` is off by default;
+padding makes scores for tall document images such as receipts less decisive, so send
+`"pad_to_square": true` only for images where squashing distorts the subject. Images
 are limited to 8 MiB after decoding. See the [runbook's known caveats](docs/runbook.md#known-caveats).
 
 Brain project: `homelab-ai`.

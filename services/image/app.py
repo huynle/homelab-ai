@@ -86,7 +86,7 @@ class ClassifyRequest(BaseModel):
     candidate_labels: list[Label] = Field(min_length=1, max_length=MAX_LABELS)
     hypothesis_template: str = Field(DEFAULT_TEMPLATE, max_length=512, pattern=r"\{\}")
     top_k: Optional[int] = Field(None, ge=1, le=MAX_LABELS)
-    pad_to_square: bool = True
+    pad_to_square: bool = False
 
     @field_validator("candidate_labels")
     @classmethod

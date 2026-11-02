@@ -113,8 +113,14 @@ def test_cache_is_bounded(encoder):
 # ---------- pad_to_square ----------
 
 
-def test_pad_to_square_on_tall_image_produces_square(client, encoder):
+def test_pad_to_square_omitted_defaults_to_no_padding(client, encoder):
     resp = classify(client, image={"base64": png_b64((40, 200))})
+    assert resp.status_code == 200
+    assert encoder.image_sizes[-1] == (40, 200)
+
+
+def test_pad_to_square_true_on_tall_image_produces_square(client, encoder):
+    resp = classify(client, image={"base64": png_b64((40, 200))}, pad_to_square=True)
     assert resp.status_code == 200
     assert encoder.image_sizes[-1] == (200, 200)
 
