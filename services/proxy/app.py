@@ -9,12 +9,11 @@ import asyncio
 import base64
 import binascii
 import contextlib
-import hashlib
-import hmac
 import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +25,7 @@ import metrics
 from adapters import ADAPTERS, Call, Result
 from config import Settings
 from errors import ApiError, error_response
+from keystore import FileKeyStore, KeyStore, SqliteKeyStore, bearer_token, legacy_key_id
 from models import (
     MAX_IMAGE_B64_CHARS,
     MAX_IMAGE_BYTES,
@@ -36,6 +36,7 @@ from models import (
     TextDecisionRequest,
 )
 from registry import IMAGE_TASK, TEXT_TASK, Registry, load_registry, registry_from_settings
+from usage import UsageAggregator
 
 log = logging.getLogger("decision_api")
 access_log = logging.getLogger("decision_api.access")
@@ -45,6 +46,7 @@ IMAGE_BODY_LIMIT = 12 * 1024 * 1024
 LIVENESS_PATH = "/healthz"
 PUBLIC_PATHS = {"/v1/health", LIVENESS_PATH}
 APP_VERSION = "1.1.0"
+MIN_PEPPER_BYTES = 32
 
 
 def _ms(start: float) -> float:
@@ -53,23 +55,46 @@ def _ms(start: float) -> float:
 
 def key_id(key: str) -> str:
     """Non-reversible short id for logs."""
-    return hashlib.sha256(key.encode()).hexdigest()[:8]
+    return legacy_key_id(key)
 
 
-def match_key(header: str | None, keys: tuple[str, ...]) -> str | None:
-    """Return the configured key matching an ``Authorization: Bearer <key>`` header, else None."""
-    if not header:
-        return None
-    scheme, _, token = header.partition(" ")
-    token = token.strip()
-    if scheme.lower() != "bearer" or not token:
-        return None
-    presented = token.encode()
-    found = None
-    for key in keys:  # compare against every key; no early exit
-        if hmac.compare_digest(presented, key.encode()):
-            found = key
-    return found
+# ---------------------------------------------------------------- key store
+
+
+def read_pepper(path: str | None) -> bytes:
+    if not path:
+        raise RuntimeError("KEYSTORE=sqlite needs DECISION_API_KEY_PEPPER_FILE")
+    try:
+        pepper = Path(path).read_bytes().strip()
+    except OSError as exc:
+        raise RuntimeError(f"DECISION_API_KEY_PEPPER_FILE {path!r} is not readable ({exc.strerror})") from None
+    if len(pepper) < MIN_PEPPER_BYTES:
+        raise RuntimeError(f"DECISION_API_KEY_PEPPER_FILE must hold at least {MIN_PEPPER_BYTES} bytes")
+    return pepper
+
+
+def open_sqlite_store(settings: Settings):
+    """Open (and migrate) the key database, upsert the owners and import the file keys. KEYSTORE=sqlite only."""
+    import db as dbmod
+    import keyservice
+
+    pepper = read_pepper(settings.pepper_file)
+    if not settings.db_path:
+        raise RuntimeError("KEYSTORE=sqlite needs DECISION_API_DB_PATH")
+    if not Path(settings.db_path).parent.is_dir():
+        raise RuntimeError(f"DECISION_API_DB_PATH {settings.db_path!r}: directory does not exist")
+    if not settings.owner_emails:
+        raise RuntimeError("KEYSTORE=sqlite needs DECISION_API_OWNER_EMAILS")
+    database = dbmod.Database.open(settings.db_path, pepper=pepper)
+    try:
+        keyservice.ensure_owners(database, settings.owner_emails)
+        imported = keyservice.import_legacy_keys(database, pepper, settings.api_keys, settings.owner_emails[0])
+    except Exception:
+        database.close()
+        raise
+    if imported:
+        log.info("imported %d key(s) from the key file as owner keys", len(imported))
+    return SqliteKeyStore(database, pepper), database, UsageAggregator(database)
 
 
 # ---------------------------------------------------------------- request parsing
@@ -154,14 +179,21 @@ def create_app(
     settings = Settings.from_env() if settings is None else settings
     if registry is None:
         registry = load_registry(settings.registry_file) if settings.registry_file else registry_from_settings(settings)
-    if not settings.api_keys and not settings.allow_no_auth:
-        raise RuntimeError(
-            "no API keys configured: set DECISION_API_KEYS_FILE or DECISION_API_KEYS "
-            "(or DECISION_API_ALLOW_NO_AUTH=1 for tests only)"
-        )
-    auth_required = bool(settings.api_keys)
-    if not auth_required:
-        log.warning("DECISION_API_ALLOW_NO_AUTH=1: serving without authentication")
+    keystore: KeyStore
+    database = usage = None
+    if settings.keystore == "sqlite":
+        keystore, database, usage = open_sqlite_store(settings)
+        auth_required = True
+    else:
+        if not settings.api_keys and not settings.allow_no_auth:
+            raise RuntimeError(
+                "no API keys configured: set DECISION_API_KEYS_FILE or DECISION_API_KEYS "
+                "(or DECISION_API_ALLOW_NO_AUTH=1 for tests only)"
+            )
+        keystore = FileKeyStore(settings.api_keys)
+        auth_required = bool(settings.api_keys)
+        if not auth_required:
+            log.warning("DECISION_API_ALLOW_NO_AUTH=1: serving without authentication")
 
     backend_urls = registry.backend_urls()
 
@@ -202,14 +234,18 @@ def create_app(
             async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False) as client:
                 app.state.http = client
                 interval = settings.backend_probe_interval_s
-                task = asyncio.create_task(probe_loop(client, interval)) if interval > 0 else None
+                tasks = [asyncio.create_task(probe_loop(client, interval))] if interval > 0 else []
+                if usage is not None:
+                    tasks.append(asyncio.create_task(usage.run(settings.usage_flush_s)))
                 try:
                     yield
                 finally:
-                    if task is not None:
+                    for task in tasks:
                         task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await task
+                    if usage is not None:
+                        await asyncio.to_thread(usage.flush)  # shutdown flush; failures are logged
         finally:
             if server is not None:
                 await asyncio.to_thread(server.shutdown)
@@ -233,38 +269,37 @@ def create_app(
         start = request.state.start = time.perf_counter()
         if request.url.path == LIVENESS_PATH:  # kubelet probes: no auth, no access-log noise, no metrics
             return await call_next(request)
-        kid = None
+        kid = principal = None
         try:
             if auth_required and request.url.path not in PUBLIC_PATHS:
-                key = match_key(request.headers.get("authorization"), settings.api_keys)
-                if key is None:
+                token = bearer_token(request.headers.get("authorization"))
+                principal = keystore.authenticate(token) if token else None
+                if principal is None:
                     response = error_response(ApiError("unauthorized", "missing or invalid API key"), _ms(start))
                 else:
-                    kid = key_id(key)
+                    kid = principal.key_id
                     response = await call_next(request)
             else:
                 response = await call_next(request)
         except Exception as exc:  # never leak internals to the client
             log.error("unhandled %s on %s %s", type(exc).__name__, request.method, request.url.path)
             response = error_response(ApiError("internal_error", "unexpected error"), _ms(start))
+        latency_ms = _ms(start)
+        model = getattr(request.state, "model", None)
         access_log.info(
             json.dumps(
                 {
                     "method": request.method,
                     "path": request.url.path,
                     "status": response.status_code,
-                    "latency_ms": _ms(start),
+                    "latency_ms": latency_ms,
                     "key_id": kid,
                 }
             )
         )
-        mx.observe_request(
-            request.url.path,
-            getattr(request.state, "model", None),
-            response.status_code,
-            kid,
-            time.perf_counter() - start,
-        )
+        mx.observe_request(request.url.path, model, response.status_code, kid, time.perf_counter() - start)
+        if usage is not None and principal is not None and principal.public_id is not None:
+            usage.record(principal.public_id, mx.route(request.url.path), model, response.status_code, latency_ms)
         return response
 
     def client(request: Request) -> httpx.AsyncClient:
@@ -358,6 +393,9 @@ def create_app(
     mx = app.state.metrics = metrics.Metrics(
         routes=routes, version=APP_VERSION, model_ids=[m.id for m in registry.models]
     )
+    app.state.keystore = keystore
+    app.state.db = database
+    app.state.usage = usage
     return app
 
 

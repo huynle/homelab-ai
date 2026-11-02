@@ -150,3 +150,54 @@ def metrics_servers(monkeypatch) -> MetricsServers:
     fake = MetricsServers()
     monkeypatch.setattr(metrics, "start_metrics_server", fake.start)
     return fake
+
+
+# ---------------------------------------------------------------- SQLite key store
+
+PEPPER = b"p" * 32 + b"-test-pepper-not-a-secret"
+OWNER = "owner@example.com"
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
+
+
+class Clock:
+    """A settable UTC clock passed as ``now=`` to the store, service and aggregator."""
+
+    def __init__(self):
+        from datetime import datetime, timedelta, timezone
+
+        self.timedelta = timedelta
+        self.value = datetime(2026, 11, 2, 18, 0, 0, tzinfo=timezone.utc)  # noqa: UP017 (3.10 has no datetime.UTC)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, **kwargs):
+        self.value = self.value + self.timedelta(**kwargs)
+        return self.value
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+@pytest.fixture
+def db(tmp_path):
+    import db as dbmod
+
+    database = dbmod.Database.open(tmp_path / "decision-api.db", pepper=PEPPER)
+    yield database
+    database.close()
+
+
+@pytest.fixture
+def owner_db(db, clock):
+    """A migrated DB with the owner from config and two invited members (alice, bob)."""
+    import keyservice as ks
+
+    ks.ensure_owners(db, [OWNER], now=clock())
+    owner = ks.get_viewer(db, OWNER)
+    ks.invite_member(db, owner, ALICE, now=clock())
+    ks.invite_member(db, owner, BOB, now=clock())
+    return db

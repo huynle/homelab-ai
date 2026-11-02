@@ -18,11 +18,15 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app
 
-COPY app.py adapters.py config.py errors.py metrics.py models.py registry.py ./
+COPY app.py adapters.py config.py db.py errors.py keyservice.py keystore.py metrics.py models.py registry.py usage.py ./
+COPY migrations/ ./migrations/
 
 # Mount secrets and config at runtime, e.g.
 #   DECISION_API_KEYS_FILE=/etc/decision-api/keys/keys
 #   DECISION_API_REGISTRY_FILE=/etc/decision-api/registry.yaml
+# Opt-in SQLite key store (off by default; needs a writable volume for the database):
+#   KEYSTORE=sqlite DECISION_API_DB_PATH=/data/decision-api.db
+#   DECISION_API_KEY_PEPPER_FILE=/etc/decision-api/pepper/pepper DECISION_API_OWNER_EMAILS=owner@example.com
 USER 10001:10001
 # 8080: the API (behind the ingress). 9090: Prometheus metrics (METRICS_PORT), internal only: scraped
 # in-cluster, never routed by the ingress.
