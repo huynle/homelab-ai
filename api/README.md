@@ -1,6 +1,6 @@
 # Decision API v1
 
-`decision-api.yaml` (OpenAPI 3.1.0) is the contract for a small proxy served at
+`decision-api.yaml` (OpenAPI 3.1.0, version 1.2.0) is the contract for a small proxy served at
 `https://decide.ai.huynle.com` (k3s). It sits in front of two backends on the `ml` VM (`10.1.10.10`):
 
 | Route | Backend | Task |
@@ -11,7 +11,9 @@
 | `GET /v1/models` | registry | served models |
 | `GET /healthz` | none | proxy liveness (public, no auth) |
 
-Every route except `GET /v1/health` and `GET /healthz` requires `Authorization: Bearer <api-key>`.
+Every `/v1` route except `GET /v1/health` requires `Authorization: Bearer <api-key>`; `GET /healthz` is
+public too. Missing, unknown, expired and revoked keys all get the same 401 `unauthorized`. `/admin` is not
+part of this contract; it has its own sign-in and its own spec (see [Admin API](#admin-api)).
 
 The proxy reads the served models from a backend registry (`services/proxy/registry.example.yaml`). A
 request picks one with `model` (an id from `GET /v1/models`); without it, the registry's default model for
@@ -77,6 +79,43 @@ been resolved. Each code maps to one HTTP status:
   (softmax over labels of `logit_scale * cosine`). The API renames this to `score`.
 
 The examples in the spec are trimmed versions of these files.
+
+## Admin API
+
+`admin-api.yaml` (OpenAPI 3.1.0, separate from the public contract) describes the admin page at
+`https://decide.ai.huynle.com/admin`: sign-in, API keys, usage and audit. The design is
+[ADR 0033](https://github.com/huynle/infra/blob/main/docs/decisions/0033-decision-api-admin-google-sign-in-sqlite-keys.md)
+in `huynle/infra`.
+
+- **Sign-in.** The app runs its own Google OIDC sign-in (PKCE, nonce, `email_verified` required) with the
+  redirect URI `https://decide.ai.huynle.com/admin/auth/callback`. It never trusts `X-Forwarded-User`.
+  The session is a server-side session in the `__Host-decision_session` cookie (`HttpOnly`, `Secure`,
+  `SameSite=Lax`, 12 hours). `POST`, `PATCH` and `DELETE` also need the `X-CSRF-Token` header (from
+  `GET /admin/api/me`) and a same-origin `Origin` header.
+- **Roles.** The owner's email comes from config. The owner invites members by email, sees every key and
+  all usage, and reads the audit log. Members manage only their own keys and see only their own usage.
+  Removing a member revokes all of their active keys and ends their sessions; the keys and their usage
+  stay visible to the owner.
+- **Google Testing mode.** The OAuth consent screen is in Testing mode, so an in-app invite is not enough:
+  the owner must also add the invitee as a Google test user in GCP (project `huynle-infra`, at most 100).
+  Otherwise Google refuses the sign-in.
+- **Keys.** Format `dk_<public_id>_<secret>`: a 12-character lowercase base32 public id (also the key's
+  `id`) and a 32-byte base64url secret. Keys are stored as HMAC-SHA256 with a server pepper. The full key
+  is shown once, at creation; listings show the prefix `dk_<public_id>_…`, name, owner email, created,
+  expiry, revoked and last-used times. Revoke is soft (`revoked_at`) and takes effect at once. Names are
+  1-64 characters, members may hold 20 active keys (the owner has no limit), and `expires_at` is optional,
+  in the future and at most 2 years ahead. `rate_limit_rpm` is reserved: always `null` and ignored for now.
+- **Usage.** Per-key daily totals in UTC by route and model: requests, client errors (4xx), server
+  errors (5xx) and total latency (for the average). Kept indefinitely; no raw request logs. Query with
+  `from`, `to`, `key_id`, `user` and `group_by=day|key|model|route`.
+- **Audit.** Owner-only log of sign-ins allowed and denied, members invited and removed, and keys created
+  and revoked.
+- **Legacy key.** The single key from the SOPS file is imported once as an owner key named
+  `imported (SOPS)`. The SOPS file stays as a break-glass key source.
+
+Admin errors use the same `{"error": {"code", "message"}}` envelope with the codes `invalid_request` (400),
+`unauthorized` (401), `forbidden` (403), `csrf_failed` (403), `not_found` (404), `conflict` (409) and
+`internal_error` (500).
 
 ## Later
 

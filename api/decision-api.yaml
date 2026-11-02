@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Homelab Decision API
-  version: 1.1.0
+  version: 1.2.0
   summary: Typed text decisions (Laya) and zero-shot image classification (SigLIP2) behind one contract.
   description: |
     A small proxy that fronts model backends on the `ml` VM:
@@ -36,7 +36,16 @@ info:
     Exceeding a size limit returns 413 `payload_too_large`; exceeding a count limit returns
     400 `invalid_request`.
 
-    All routes require a bearer API key except `GET /v1/health` and `GET /healthz`.
+    Authentication:
+
+    - The `/v1` API routes require a bearer API key (`Authorization: Bearer <api-key>`),
+      except `GET /v1/health`, which is public.
+    - `GET /healthz` is public.
+    - `/admin` (key management, usage and audit) is not part of this contract. It uses its own
+      session sign-in and is documented in `admin-api.yaml`.
+
+    Missing, malformed, unknown, expired and revoked keys all return the same 401 `unauthorized`
+    with the same generic message, so a caller cannot tell which case applied.
 servers:
   - url: https://decide.ai.huynle.com
     description: Production (k3s, Traefik, API keys).
@@ -310,7 +319,11 @@ components:
     apiKey:
       type: http
       scheme: bearer
-      description: "Static API key sent as `Authorization: Bearer <key>`."
+      description: |
+        API key sent as `Authorization: Bearer <key>`. Keys issued in the admin page
+        (`admin-api.yaml`) have the form `dk_<public_id>_<secret>`. The legacy key imported from
+        SOPS, and the break-glass keys in the proxy's key file, keep their original form.
+        Expired and revoked keys are rejected like unknown keys.
   responses:
     InvalidRequest:
       description: "`invalid_request` - malformed body, schema violation, unknown model pin, or a count limit exceeded."
@@ -320,7 +333,9 @@ components:
           example:
             error: {code: invalid_request, message: "questions: at most 32 questions are allowed"}
     Unauthorized:
-      description: "`unauthorized` - missing or invalid bearer key."
+      description: |
+        `unauthorized` - missing, malformed, unknown, expired or revoked bearer key. All cases return
+        the same generic message.
       headers:
         WWW-Authenticate:
           schema: {type: string, example: Bearer}
