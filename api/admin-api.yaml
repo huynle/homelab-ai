@@ -1,0 +1,1070 @@
+openapi: 3.1.0
+info:
+  title: Homelab Decision API - Admin
+  version: 1.0.0
+  summary: Sign-in, API key management, usage and audit for the decision API.
+  description: |
+    The admin page of the decision API proxy, served at `https://decide.ai.huynle.com/admin` on the
+    same host as the public API (`decision-api.yaml`). Design: ADR 0033 in `huynle/infra`
+    (`docs/decisions/0033-decision-api-admin-google-sign-in-sqlite-keys.md`).
+
+    Paths in this document are relative to the server URL `https://decide.ai.huynle.com/admin`,
+    so `/api/keys` is `https://decide.ai.huynle.com/admin/api/keys`. The JSON API lives under
+    `/admin/api`. HTML pages are out of scope, except the sign-in redirects under `/admin/auth`.
+
+    ## Sign-in
+
+    The app runs its own Google OIDC sign-in (authorization code with PKCE and nonce). The redirect
+    URI is exactly `https://decide.ai.huynle.com/admin/auth/callback`. Sign-in succeeds only when the
+    ID token has `email_verified: true` and the email (compared lowercased) is the owner email from
+    config or an invited member. The app never trusts `X-Forwarded-User` or any other identity
+    header: the route is public and such headers can be spoofed.
+
+    ## Session and CSRF
+
+    - Session cookie `__Host-decision_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`,
+      no `Domain`. Its value is an opaque random id; the session lives server-side, so removing a
+      member ends their sessions at once. Sessions expire 12 hours after sign-in (not sliding).
+    - Unsafe methods (`POST`, `PATCH`, `DELETE`) also need:
+      - header `X-CSRF-Token` equal to the session's CSRF token, which `GET /api/me` returns (the
+        HTML page may also embed it);
+      - header `Origin` equal to `https://decide.ai.huynle.com`. A missing or different `Origin`
+        fails the check.
+
+      Either failure returns 403 `csrf_failed`.
+    - The JSON API never redirects: without a valid session it returns 401 `unauthorized`.
+    - API responses carry `Cache-Control: no-store`.
+
+    ## Roles
+
+    - **owner**: the one email in config (not stored in the member table, cannot be invited or
+      removed). Sees and revokes every key, sees all usage, manages members, reads the audit log.
+    - **member**: an invited email. Creates, renames and revokes only their own keys and sees only
+      their own keys' usage. Another user's key looks the same to a member as a key that does not
+      exist (404 `not_found`).
+
+    ## Keys
+
+    - Format `dk_<public_id>_<secret>`: `public_id` is 12 lowercase base32 characters (`a-z`, `2-7`)
+      and is also the key `id`; `secret` is 32 random bytes, base64url without padding (43 characters).
+    - Stored as HMAC-SHA256 with a server pepper, never in plain text. The full key is returned
+      once, in the `201` response of `POST /api/keys`, and can never be read again.
+    - Listings show `prefix` (`dk_<public_id>_…`), never the secret.
+    - Revoke is soft: it sets `revoked_at` and the key stops working at once. Revoked keys stay
+      listed and keep their usage history. Revoked keys cannot be restored or renamed.
+    - Limits: `name` 1-64 characters; at most 20 active (not revoked, not expired) keys per member,
+      no limit for the owner; `expires_at` is optional and must be in the future and at most
+      2 years (730 days) after the request.
+    - `rate_limit_rpm` is reserved for later. It is always `null` today, read-only, and ignored by
+      the proxy. Requests that send it are rejected (400), because bodies allow no unknown fields.
+    - Legacy key: the single key from the SOPS file is imported once as an owner key named
+      `imported (SOPS)` with `source: imported`. It keeps its original value, so its prefix is shown
+      as `imported…`. The SOPS file stays as a break-glass key source and is not managed here.
+
+    ## Usage
+
+    Per-key daily totals (UTC dates), kept indefinitely, by route and model: requests, client
+    errors (HTTP 4xx), server errors (HTTP 5xx) and total latency. Only requests that presented a
+    valid key are counted, because others cannot be attributed. No raw request logs are kept.
+
+    ## Errors
+
+    Every failure returns `{"error": {"code", "message"}}`, the same envelope as the public API.
+    Each code maps to one HTTP status:
+
+    | code              | HTTP |
+    |-------------------|------|
+    | `invalid_request` | 400  |
+    | `unauthorized`    | 401  |
+    | `forbidden`       | 403  |
+    | `csrf_failed`     | 403  |
+    | `not_found`       | 404  |
+    | `conflict`        | 409  |
+    | `internal_error`  | 500  |
+
+    There are no rate limits yet.
+servers:
+  - url: https://decide.ai.huynle.com/admin
+    description: Production admin page.
+security:
+  - session: []
+tags:
+  - name: auth
+  - name: me
+  - name: keys
+  - name: usage
+  - name: members
+    description: Owner only.
+  - name: audit
+    description: Owner only.
+paths:
+  /auth/login:
+    get:
+      tags: [auth]
+      operationId: login
+      summary: Start Google sign-in.
+      description: |
+        Redirects to Google's authorization endpoint with `state`, `nonce` and a PKCE
+        `code_challenge` (S256). Stores `state`, `nonce`, the PKCE verifier and `next` in a
+        short-lived cookie `__Host-decision_oauth` (`HttpOnly`, `Secure`, `SameSite=Lax`,
+        `Max-Age=600`). An invalid `next` is ignored and `/admin` is used instead.
+      security: []
+      parameters:
+        - name: next
+          in: query
+          required: false
+          description: |
+            Where to go after sign-in. Only same-origin paths under `/admin` are accepted: it must
+            start with `/admin`, followed by end of string, `/`, `?` or `#`. Absolute URLs,
+            `//host` and backslashes are rejected.
+          schema:
+            type: string
+            maxLength: 512
+            pattern: "^/admin([/?#][^\\\\]*)?$"
+          examples:
+            keys:
+              value: /admin/keys
+      responses:
+        "302":
+          description: Redirect to Google.
+          headers:
+            Location:
+              schema: {type: string, format: uri}
+              example: "https://accounts.google.com/o/oauth2/v2/auth?client_id=…&redirect_uri=https%3A%2F%2Fdecide.ai.huynle.com%2Fadmin%2Fauth%2Fcallback&response_type=code&scope=openid%20email&state=…&nonce=…&code_challenge=…&code_challenge_method=S256"
+            Set-Cookie:
+              schema: {type: string}
+              example: "__Host-decision_oauth=…; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
+  /auth/callback:
+    get:
+      tags: [auth]
+      operationId: authCallback
+      summary: Google redirect target; finish sign-in.
+      description: |
+        Checks `state` against the `__Host-decision_oauth` cookie, exchanges `code` with the PKCE
+        verifier, checks the ID token (signature, issuer, audience, expiry, `nonce`,
+        `email_verified`) and the allow list (owner email or invited member). On success it creates
+        a session and redirects to `next`. Every attempt is audited as `sign_in.allowed` or
+        `sign_in.denied`. The oauth cookie is cleared in every case.
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema: {type: string, maxLength: 2048}
+          examples:
+            google:
+              value: 4/0AeanS0abc
+        - name: state
+          in: query
+          required: true
+          schema: {type: string, maxLength: 256}
+          examples:
+            google:
+              value: q3v9yJm2hW0x7c5bE1tLrA
+        - name: error
+          in: query
+          required: false
+          description: Set by Google when the user cancels or Google refuses; the sign-in is denied.
+          schema: {type: string, maxLength: 256}
+          examples:
+            cancelled:
+              value: access_denied
+      responses:
+        "302":
+          description: Signed in; redirect to `next` (default `/admin`).
+          headers:
+            Location:
+              schema: {type: string}
+              example: /admin
+            Set-Cookie:
+              schema: {type: string}
+              example: "__Host-decision_session=…; Path=/; Max-Age=43200; HttpOnly; Secure; SameSite=Lax"
+        "400":
+          description: |
+            HTML error page. Missing `code`, missing or expired oauth cookie, or `state` mismatch
+            (for example a stale or forged callback). Audited as `sign_in.denied`.
+          content:
+            text/html:
+              schema: {type: string}
+              example: "<!doctype html><title>Sign-in failed</title><p>Sign-in expired. <a href=\"/admin/auth/login\">Try again</a>.</p>"
+        "403":
+          description: |
+            HTML page. The Google account is valid but not allowed: email not verified, not the
+            owner and not an invited member, or Google returned `error`. The page does not say
+            which. Audited as `sign_in.denied`.
+          content:
+            text/html:
+              schema: {type: string}
+              example: "<!doctype html><title>Not allowed</title><p>This Google account is not allowed. Ask the owner for an invite.</p>"
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: End the current session.
+      description: Deletes the server-side session and clears the cookie.
+      security:
+        - session: []
+          csrf: []
+      responses:
+        "204":
+          description: Signed out.
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              example: "__Host-decision_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/CsrfFailed"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: The signed-in user and the session's CSRF token.
+      responses:
+        "200":
+          description: Current user.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Me"}
+              examples:
+                owner:
+                  value: {email: owner@example.com, role: owner, csrf_token: "Zr4kB7m1qP9sV2xD8nC5tL0aWfHjE3yU6oIgR"}
+                member:
+                  value: {email: alice@example.com, role: member, csrf_token: "pD2wQ8vL5nM1zX7cB4hJ9kF0sA6tR3yE8gUiO"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/keys:
+    get:
+      tags: [keys]
+      operationId: listKeys
+      summary: List API keys.
+      description: |
+        Members get their own keys. The owner gets every key, or one user's keys with `user`.
+        A member may pass only their own email as `user`; any other value returns 403. Sorted by
+        `created_at`, newest first. Revoked and expired keys are included.
+      parameters:
+        - $ref: "#/components/parameters/UserFilter"
+      responses:
+        "200":
+          description: Keys.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KeyList"}
+              examples:
+                owner_all:
+                  summary: Owner, no filter
+                  value:
+                    keys:
+                      - id: k7m2q4x6w3ab
+                        name: home-assistant
+                        prefix: dk_k7m2q4x6w3ab_…
+                        source: issued
+                        owner_email: alice@example.com
+                        status: active
+                        created_at: "2026-11-02T18:04:11Z"
+                        expires_at: "2027-11-02T00:00:00Z"
+                        revoked_at: null
+                        last_used_at: "2026-11-02T19:30:02Z"
+                        rate_limit_rpm: null
+                      - id: p3r5t7v2z4cd
+                        name: imported (SOPS)
+                        prefix: imported…
+                        source: imported
+                        owner_email: owner@example.com
+                        status: active
+                        created_at: "2026-11-02T17:00:00Z"
+                        expires_at: null
+                        revoked_at: null
+                        last_used_at: "2026-11-02T19:41:55Z"
+                        rate_limit_rpm: null
+                      - id: b6d2f4h7j3ef
+                        name: old laptop
+                        prefix: dk_b6d2f4h7j3ef_…
+                        source: issued
+                        owner_email: alice@example.com
+                        status: revoked
+                        created_at: "2026-11-02T17:20:40Z"
+                        expires_at: null
+                        revoked_at: "2026-11-02T18:00:03Z"
+                        last_used_at: null
+                        rate_limit_rpm: null
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "400": {$ref: "#/components/responses/InvalidRequest"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    post:
+      tags: [keys]
+      operationId: createKey
+      summary: Create a key for the signed-in user.
+      description: |
+        Always creates the key for the caller (the owner cannot create keys for members). The
+        response contains the full key; it is shown only this once. Audited as `key.created`.
+        A member who already has 20 active keys gets 409 `conflict`.
+      security:
+        - session: []
+          csrf: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KeyCreate"}
+            examples:
+              with_expiry:
+                value: {name: home-assistant, expires_at: "2027-11-02T00:00:00Z"}
+              no_expiry:
+                value: {name: n8n}
+      responses:
+        "201":
+          description: Created. `key` is the full secret and is never returned again.
+          headers:
+            Location:
+              schema: {type: string}
+              example: /admin/api/keys/k7m2q4x6w3ab
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CreatedKey"}
+              examples:
+                with_expiry:
+                  value:
+                    key: dk_k7m2q4x6w3ab_x2Vb8pQ1sN4mK7rT0wY3zA6cE9fH2jL5nP8qS1uW4xZ
+                    id: k7m2q4x6w3ab
+                    name: home-assistant
+                    prefix: dk_k7m2q4x6w3ab_…
+                    source: issued
+                    owner_email: alice@example.com
+                    status: active
+                    created_at: "2026-11-02T18:04:11Z"
+                    expires_at: "2027-11-02T00:00:00Z"
+                    revoked_at: null
+                    last_used_at: null
+                    rate_limit_rpm: null
+        "400":
+          description: "`invalid_request` - bad name, `expires_at` in the past or more than 2 years ahead, or unknown fields."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                expiry_too_far:
+                  value:
+                    error: {code: invalid_request, message: "expires_at: must be at most 2 years from now"}
+                unknown_field:
+                  value:
+                    error: {code: invalid_request, message: "rate_limit_rpm: unknown field"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/CsrfFailed"}
+        "409":
+          description: "`conflict` - the member already has 20 active keys."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                key_limit:
+                  value:
+                    error: {code: conflict, message: at most 20 active keys per member; revoke one first}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/keys/{id}:
+    parameters:
+      - $ref: "#/components/parameters/KeyId"
+    patch:
+      tags: [keys]
+      operationId: updateKey
+      summary: Rename a key.
+      description: |
+        Only `name` can change. Members may rename their own keys; the owner may rename any key.
+        A revoked key cannot be renamed (409). An empty body is a no-op and returns the key.
+      security:
+        - session: []
+          csrf: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KeyUpdate"}
+            examples:
+              rename:
+                value: {name: home-assistant (garage)}
+      responses:
+        "200":
+          description: Updated key.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Key"}
+              examples:
+                renamed:
+                  value:
+                    id: k7m2q4x6w3ab
+                    name: home-assistant (garage)
+                    prefix: dk_k7m2q4x6w3ab_…
+                    source: issued
+                    owner_email: alice@example.com
+                    status: active
+                    created_at: "2026-11-02T18:04:11Z"
+                    expires_at: "2027-11-02T00:00:00Z"
+                    revoked_at: null
+                    last_used_at: "2026-11-02T19:30:02Z"
+                    rate_limit_rpm: null
+        "400": {$ref: "#/components/responses/InvalidRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/CsrfFailed"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: "`conflict` - the key is revoked."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                revoked:
+                  value:
+                    error: {code: conflict, message: key is revoked}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/keys/{id}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/KeyId"
+    post:
+      tags: [keys]
+      operationId: revokeKey
+      summary: Revoke a key (soft, immediate, permanent).
+      description: |
+        Sets `revoked_at`; the key fails authentication from the next request. Idempotent:
+        revoking a revoked key returns 200 with the original `revoked_at` and writes no new audit
+        entry. Members may revoke their own keys; the owner may revoke any key, including the
+        imported one. Audited as `key.revoked`.
+      security:
+        - session: []
+          csrf: []
+      responses:
+        "200":
+          description: The revoked key.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Key"}
+              examples:
+                revoked:
+                  value:
+                    id: b6d2f4h7j3ef
+                    name: old laptop
+                    prefix: dk_b6d2f4h7j3ef_…
+                    source: issued
+                    owner_email: alice@example.com
+                    status: revoked
+                    created_at: "2026-11-02T17:20:40Z"
+                    expires_at: null
+                    revoked_at: "2026-11-02T18:00:03Z"
+                    last_used_at: null
+                    rate_limit_rpm: null
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/CsrfFailed"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/usage:
+    get:
+      tags: [usage]
+      operationId: getUsage
+      summary: Daily usage totals.
+      description: |
+        Aggregates the per-key daily totals over `from`..`to` (UTC dates, both inclusive) and groups
+        them by `group_by`. Members see only their own keys: a `user` other than their own email
+        returns 403 and a `key_id` that is not theirs returns 404. The owner sees all users and keys.
+        Rows with no requests are omitted. `avg_latency_ms` is `total_latency_ms / requests`.
+        `model` is `null` for requests that failed before a model was resolved.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: First UTC date, inclusive. Default is 29 days before `to`.
+          schema: {type: string, format: date}
+          examples:
+            start:
+              value: "2026-11-01"
+        - name: to
+          in: query
+          required: false
+          description: Last UTC date, inclusive. Default is today (UTC). `to - from` must be 0 to 365 days.
+          schema: {type: string, format: date}
+          examples:
+            end:
+              value: "2026-11-02"
+        - name: key_id
+          in: query
+          required: false
+          schema: {$ref: "#/components/schemas/KeyIdValue"}
+          examples:
+            one_key:
+              value: k7m2q4x6w3ab
+        - $ref: "#/components/parameters/UserFilter"
+        - name: group_by
+          in: query
+          required: false
+          description: "`day` (default), `key`, `model` or `route`."
+          schema:
+            type: string
+            enum: [day, key, model, route]
+            default: day
+          examples:
+            by_model:
+              value: model
+      responses:
+        "200":
+          description: Usage rows and their total.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageReport"}
+              examples:
+                by_day:
+                  summary: "group_by=day"
+                  value:
+                    from: "2026-11-01"
+                    to: "2026-11-02"
+                    group_by: day
+                    rows:
+                      - {date: "2026-11-01", requests: 120, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 70320, avg_latency_ms: 586}
+                      - {date: "2026-11-02", requests: 85, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 47175, avg_latency_ms: 555}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                by_key:
+                  summary: "group_by=key (owner)"
+                  value:
+                    from: "2026-11-01"
+                    to: "2026-11-02"
+                    group_by: key
+                    rows:
+                      - {key_id: k7m2q4x6w3ab, key_name: home-assistant, owner_email: alice@example.com, requests: 150, errors: 3, client_errors: 3, server_errors: 0, total_latency_ms: 84000, avg_latency_ms: 560}
+                      - {key_id: p3r5t7v2z4cd, key_name: imported (SOPS), owner_email: owner@example.com, requests: 55, errors: 1, client_errors: 0, server_errors: 1, total_latency_ms: 33495, avg_latency_ms: 609}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                by_model:
+                  summary: "group_by=model"
+                  value:
+                    from: "2026-11-01"
+                    to: "2026-11-02"
+                    group_by: model
+                    rows:
+                      - {model: laya-english, requests: 180, errors: 1, client_errors: 0, server_errors: 1, total_latency_ms: 108000, avg_latency_ms: 600}
+                      - {model: siglip2-base-patch16-224, requests: 22, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 9420, avg_latency_ms: 428.1818}
+                      - {model: null, requests: 3, errors: 3, client_errors: 3, server_errors: 0, total_latency_ms: 75, avg_latency_ms: 25}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                by_route:
+                  summary: "group_by=route"
+                  value:
+                    from: "2026-11-01"
+                    to: "2026-11-02"
+                    group_by: route
+                    rows:
+                      - {route: /v1/decide/text, requests: 181, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 108000, avg_latency_ms: 596.6851}
+                      - {route: /v1/classify/image, requests: 22, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 9420, avg_latency_ms: 428.1818}
+                      - {route: /v1/models, requests: 2, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 75, avg_latency_ms: 37.5}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+        "400":
+          description: "`invalid_request` - bad date, `from` after `to`, range over 366 days, or unknown `group_by`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                range:
+                  value:
+                    error: {code: invalid_request, message: "from: must not be after to"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/members:
+    get:
+      tags: [members]
+      operationId: listMembers
+      summary: List the owner and the invited members (owner only).
+      description: The owner is listed first, then members by `invited_at`.
+      responses:
+        "200":
+          description: Members.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemberList"}
+              examples:
+                two:
+                  value:
+                    members:
+                      - {email: owner@example.com, role: owner, invited_at: null, invited_by: null, last_sign_in_at: "2026-11-02T17:58:00Z", active_keys: 1}
+                      - {email: alice@example.com, role: member, invited_at: "2026-11-02T17:10:00Z", invited_by: owner@example.com, last_sign_in_at: "2026-11-02T18:02:30Z", active_keys: 1}
+                      - {email: bob@example.com, role: member, invited_at: "2026-11-02T18:30:00Z", invited_by: owner@example.com, last_sign_in_at: null, active_keys: 0}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "500": {$ref: "#/components/responses/InternalError"}
+    post:
+      tags: [members]
+      operationId: inviteMember
+      summary: Invite a member by email (owner only).
+      description: |
+        Adds the email (stored lowercased) to the allow list. No email is sent. While the Google
+        consent screen is in Testing mode, the owner must also add the address as a test user in
+        GCP, or Google refuses the sign-in. Inviting the owner email or an existing member returns
+        409. A removed member can be invited again; their old keys stay revoked. Audited as
+        `member.invited`.
+      security:
+        - session: []
+          csrf: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/MemberInvite"}
+            examples:
+              invite:
+                value: {email: bob@example.com}
+              explicit_role:
+                value: {email: carol@example.com, role: member}
+      responses:
+        "201":
+          description: Invited.
+          headers:
+            Location:
+              schema: {type: string}
+              example: /admin/api/members/bob@example.com
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Member"}
+              examples:
+                invited:
+                  value: {email: bob@example.com, role: member, invited_at: "2026-11-02T18:30:00Z", invited_by: owner@example.com, last_sign_in_at: null, active_keys: 0}
+        "400": {$ref: "#/components/responses/InvalidRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409":
+          description: "`conflict` - the email is already a member or is the owner."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                duplicate:
+                  value:
+                    error: {code: conflict, message: bob@example.com is already a member}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/members/{email}:
+    delete:
+      tags: [members]
+      operationId: removeMember
+      summary: Remove a member and revoke their keys (owner only).
+      description: |
+        In one transaction: removes the email from the allow list, revokes every key the member
+        still has active (setting `revoked_at`), and deletes their sessions. Their keys and usage
+        stay visible to the owner. Audited as one `member.removed` entry plus one `key.revoked`
+        entry per key revoked. The owner email cannot be removed (403). Removing the address from
+        the GCP test users is a separate manual step.
+      security:
+        - session: []
+          csrf: []
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: Member email, URL-encoded; matched case-insensitively.
+          schema: {type: string, format: email, maxLength: 254}
+          examples:
+            bob:
+              value: bob@example.com
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemberRemoved"}
+              examples:
+                removed:
+                  value: {email: alice@example.com, revoked_keys: [k7m2q4x6w3ab]}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403":
+          description: "`forbidden` (caller is not the owner, or the target is the owner) or `csrf_failed`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                owner:
+                  value:
+                    error: {code: forbidden, message: the owner cannot be removed}
+                csrf:
+                  value:
+                    error: {code: csrf_failed, message: missing or invalid CSRF token or Origin}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500": {$ref: "#/components/responses/InternalError"}
+  /api/audit:
+    get:
+      tags: [audit]
+      operationId: listAudit
+      summary: Audit log, newest first (owner only).
+      description: |
+        Entries in `from`..`to` (UTC dates, inclusive; defaults as in `GET /api/usage`), newest
+        first. Page with `before`: pass the `next_before` of the previous page. Entries are kept
+        indefinitely. No IP addresses or tokens are recorded.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema: {type: string, format: date}
+          examples:
+            start:
+              value: "2026-11-01"
+        - name: to
+          in: query
+          required: false
+          schema: {type: string, format: date}
+          examples:
+            end:
+              value: "2026-11-02"
+        - name: before
+          in: query
+          required: false
+          description: Return entries with `id` lower than this.
+          schema: {type: integer, minimum: 1}
+          examples:
+            page2:
+              value: 1040
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 500, default: 100}
+          examples:
+            small:
+              value: 50
+      responses:
+        "200":
+          description: Audit entries.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditPage"}
+              examples:
+                recent:
+                  value:
+                    entries:
+                      - {id: 1046, at: "2026-11-02T18:31:12Z", event: member.removed, actor_email: owner@example.com, target_email: alice@example.com, key_id: null, detail: {revoked_keys: 1}}
+                      - {id: 1045, at: "2026-11-02T18:31:12Z", event: key.revoked, actor_email: owner@example.com, target_email: alice@example.com, key_id: k7m2q4x6w3ab, detail: {reason: member_removed}}
+                      - {id: 1044, at: "2026-11-02T18:30:00Z", event: member.invited, actor_email: owner@example.com, target_email: bob@example.com, key_id: null, detail: {role: member}}
+                      - {id: 1043, at: "2026-11-02T18:04:11Z", event: key.created, actor_email: alice@example.com, target_email: alice@example.com, key_id: k7m2q4x6w3ab, detail: {name: home-assistant}}
+                      - {id: 1042, at: "2026-11-02T18:02:30Z", event: sign_in.allowed, actor_email: alice@example.com, target_email: null, key_id: null, detail: {role: member}}
+                      - {id: 1041, at: "2026-11-02T18:01:05Z", event: sign_in.denied, actor_email: mallory@example.com, target_email: null, key_id: null, detail: {reason: not_invited}}
+                    next_before: 1041
+        "400": {$ref: "#/components/responses/InvalidRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "500": {$ref: "#/components/responses/InternalError"}
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: __Host-decision_session
+      description: |
+        Server-side session set by `GET /auth/callback` (`HttpOnly`, `Secure`, `SameSite=Lax`,
+        `Path=/`, 12 h absolute lifetime).
+    csrf:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: |
+        Required with the session on `POST`, `PATCH` and `DELETE`, together with an `Origin` header
+        equal to `https://decide.ai.huynle.com`. The token comes from `GET /api/me`.
+  parameters:
+    KeyId:
+      name: id
+      in: path
+      required: true
+      description: Key id (its `public_id`).
+      schema: {$ref: "#/components/schemas/KeyIdValue"}
+      examples:
+        key:
+          value: k7m2q4x6w3ab
+    UserFilter:
+      name: user
+      in: query
+      required: false
+      description: Limit to one user's keys, by email. Owner only, except a member's own email.
+      schema: {type: string, format: email, maxLength: 254}
+      examples:
+        alice:
+          value: alice@example.com
+  responses:
+    InvalidRequest:
+      description: "`invalid_request` - malformed body or query, schema violation, or unknown fields."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: invalid_request, message: "name: must be 1 to 64 characters"}
+    Unauthorized:
+      description: "`unauthorized` - not signed in, or the session expired or was ended."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: unauthorized, message: sign in required}
+    Forbidden:
+      description: "`forbidden` - signed in but not allowed (for example, not the owner)."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: forbidden, message: owner only}
+    CsrfFailed:
+      description: "`csrf_failed` - missing or wrong `X-CSRF-Token`, or a missing or foreign `Origin`."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: csrf_failed, message: missing or invalid CSRF token or Origin}
+    NotFound:
+      description: "`not_found` - no such resource, or it belongs to another user."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: not_found, message: key not found}
+    InternalError:
+      description: "`internal_error` - unexpected failure inside the app."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+          example:
+            error: {code: internal_error, message: unexpected error}
+  schemas:
+    # ---------- errors ----------
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error: {$ref: "#/components/schemas/Error"}
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [unauthorized, forbidden, csrf_failed, not_found, invalid_request, conflict, internal_error]
+          description: |
+            `invalid_request`=400, `unauthorized`=401, `forbidden`=403, `csrf_failed`=403,
+            `not_found`=404, `conflict`=409, `internal_error`=500.
+        message:
+          type: string
+          description: Human-readable explanation. Never contains secrets or key material.
+    # ---------- me ----------
+    Role:
+      type: string
+      enum: [owner, member]
+    Me:
+      type: object
+      required: [email, role, csrf_token]
+      properties:
+        email: {type: string, format: email}
+        role: {$ref: "#/components/schemas/Role"}
+        csrf_token:
+          type: string
+          minLength: 32
+          description: Send as `X-CSRF-Token` on unsafe methods. Valid for the session's lifetime.
+    # ---------- keys ----------
+    KeyIdValue:
+      type: string
+      pattern: "^[a-z2-7]{12}$"
+      description: The key's `public_id`, 12 lowercase base32 characters.
+    KeyName:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: Free label, 1-64 characters, trimmed of surrounding whitespace.
+    Key:
+      type: object
+      required: [id, name, prefix, source, owner_email, status, created_at, expires_at, revoked_at, last_used_at, rate_limit_rpm]
+      properties:
+        id: {$ref: "#/components/schemas/KeyIdValue"}
+        name: {$ref: "#/components/schemas/KeyName"}
+        prefix:
+          type: string
+          description: "`dk_<public_id>_…` for issued keys, `imported…` for the imported legacy key."
+          pattern: "^(dk_[a-z2-7]{12}_…|imported…)$"
+        source:
+          type: string
+          enum: [issued, imported]
+          description: "`imported` only for the legacy key imported from SOPS."
+        owner_email: {type: string, format: email}
+        status:
+          type: string
+          enum: [active, expired, revoked]
+          description: Derived from `revoked_at` and `expires_at`; `revoked` wins over `expired`.
+        created_at: {type: string, format: date-time}
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: When the key stops working; `null` means it never expires.
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+        last_used_at:
+          type: [string, "null"]
+          format: date-time
+          description: Last successful authentication, updated at most once a minute.
+        rate_limit_rpm:
+          type: [integer, "null"]
+          minimum: 1
+          readOnly: true
+          description: Reserved for a later per-key rate limit. Always `null` now and ignored.
+    CreatedKey:
+      allOf:
+        - $ref: "#/components/schemas/Key"
+        - type: object
+          required: [key]
+          properties:
+            key:
+              type: string
+              pattern: "^dk_[a-z2-7]{12}_[A-Za-z0-9_-]{43,}$"
+              description: The full key. Returned only in this response; store it now.
+    KeyList:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: {$ref: "#/components/schemas/Key"}
+    KeyCreate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/KeyName"}
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: Optional; must be in the future and at most 2 years (730 days) from now.
+    KeyUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/KeyName"}
+    # ---------- usage ----------
+    UsageTotals:
+      type: object
+      required: [requests, errors, client_errors, server_errors, total_latency_ms, avg_latency_ms]
+      properties:
+        requests: {type: integer, minimum: 0}
+        errors:
+          type: integer
+          minimum: 0
+          description: Responses with HTTP status >= 400; `client_errors + server_errors`.
+        client_errors: {type: integer, minimum: 0, description: HTTP 4xx responses.}
+        server_errors: {type: integer, minimum: 0, description: HTTP 5xx responses.}
+        total_latency_ms: {type: number, minimum: 0}
+        avg_latency_ms:
+          type: [number, "null"]
+          minimum: 0
+          description: "`total_latency_ms / requests`; `null` when `requests` is 0."
+    UsageRow:
+      allOf:
+        - $ref: "#/components/schemas/UsageTotals"
+        - type: object
+          description: |
+            Has exactly the dimension fields of `group_by`: `date` for `day`; `key_id`, `key_name`
+            and `owner_email` for `key`; `model` for `model`; `route` for `route`.
+          properties:
+            date: {type: string, format: date}
+            key_id: {$ref: "#/components/schemas/KeyIdValue"}
+            key_name: {type: string}
+            owner_email: {type: string, format: email}
+            model:
+              type: [string, "null"]
+              description: Served model id; `null` when no model was resolved.
+            route:
+              type: string
+              description: Request path of the public API route.
+              examples: [/v1/decide/text, /v1/classify/image, /v1/models]
+    UsageReport:
+      type: object
+      required: [from, to, group_by, rows, total]
+      properties:
+        from: {type: string, format: date}
+        to: {type: string, format: date}
+        group_by:
+          type: string
+          enum: [day, key, model, route]
+        rows:
+          type: array
+          description: Sorted by `date` ascending for `day`, otherwise by `requests` descending.
+          items: {$ref: "#/components/schemas/UsageRow"}
+        total: {$ref: "#/components/schemas/UsageTotals"}
+    # ---------- members ----------
+    Member:
+      type: object
+      required: [email, role, invited_at, invited_by, last_sign_in_at, active_keys]
+      properties:
+        email: {type: string, format: email}
+        role: {$ref: "#/components/schemas/Role"}
+        invited_at:
+          type: [string, "null"]
+          format: date-time
+          description: "`null` for the owner."
+        invited_by:
+          type: [string, "null"]
+          format: email
+        last_sign_in_at:
+          type: [string, "null"]
+          format: date-time
+        active_keys: {type: integer, minimum: 0}
+    MemberList:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          items: {$ref: "#/components/schemas/Member"}
+    MemberInvite:
+      type: object
+      required: [email]
+      additionalProperties: false
+      properties:
+        email: {type: string, format: email, maxLength: 254}
+        role:
+          type: string
+          enum: [member]
+          default: member
+          description: Only `member`; the owner comes from config.
+    MemberRemoved:
+      type: object
+      required: [email, revoked_keys]
+      properties:
+        email: {type: string, format: email}
+        revoked_keys:
+          type: array
+          description: Ids of the keys this removal revoked (already revoked keys are not listed).
+          items: {$ref: "#/components/schemas/KeyIdValue"}
+    # ---------- audit ----------
+    AuditEntry:
+      type: object
+      required: [id, at, event, actor_email, target_email, key_id, detail]
+      properties:
+        id: {type: integer, minimum: 1}
+        at: {type: string, format: date-time}
+        event:
+          type: string
+          enum: [sign_in.allowed, sign_in.denied, member.invited, member.removed, key.created, key.revoked]
+        actor_email:
+          type: [string, "null"]
+          description: |
+            Who acted. For `sign_in.*` this is the email Google returned (even if unverified or not
+            invited), or `null` when no ID token was obtained.
+        target_email:
+          type: [string, "null"]
+          description: The member or key owner affected, when there is one.
+        key_id:
+          oneOf:
+            - $ref: "#/components/schemas/KeyIdValue"
+            - type: "null"
+        detail:
+          type: object
+          additionalProperties: true
+          description: |
+            Event-specific. `sign_in.allowed`: `role`. `sign_in.denied`: `reason`, one of
+            `not_invited`, `email_unverified`, `state_mismatch`, `google_error`, `token_invalid`.
+            `member.invited`: `role`. `member.removed`: `revoked_keys` (count). `key.created`: `name`.
+            `key.revoked`: `reason`, `user` or `member_removed`.
+    AuditPage:
+      type: object
+      required: [entries, next_before]
+      properties:
+        entries:
+          type: array
+          items: {$ref: "#/components/schemas/AuditEntry"}
+        next_before:
+          type: [integer, "null"]
+          description: Pass as `before` for the next page; `null` on the last page.
