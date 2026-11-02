@@ -359,7 +359,12 @@ def test_health_down_is_503(client, backends):
     backends.image_health = raise_(httpx.ConnectError("refused"))
     resp = client.get("/v1/health")
     assert resp.status_code == 503
-    assert resp.json() == {"status": "down", "backends": {"text": {"status": "down"}, "image": {"status": "down"}}}
+    body = resp.json()
+    assert {k: body[k] for k in ("status", "backends")} == {
+        "status": "down",
+        "backends": {"text": {"status": "down"}, "image": {"status": "down"}},
+    }
+    assert body["models"] and all(m == {"status": "down"} for m in body["models"].values())
 
 
 def test_health_does_not_forward_authorization(client, auth, backends):

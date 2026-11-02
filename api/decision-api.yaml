@@ -1,14 +1,18 @@
 openapi: 3.1.0
 info:
   title: Homelab Decision API
-  version: 1.0.0
+  version: 1.1.0
   summary: Typed text decisions (Laya) and zero-shot image classification (SigLIP2) behind one contract.
   description: |
-    A small proxy on the `ml` VM that fronts two local backends:
+    A small proxy that fronts model backends on the `ml` VM:
 
     - **text** - Laya (`laya[serve]` 0.4.20) typed decisions: `choice`, `score`, `noul`.
     - **image** - SigLIP2 zero-shot classification
       (`google/siglip2-base-patch16-224`, commit `75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2`).
+
+    The served models come from the proxy's backend registry and are listed by `GET /v1/models`.
+    A request selects one with `model` (a model id from that list); without `model`, the
+    registry's default model for the route's task serves it.
 
     Every successful response is an `Envelope`; every failure is an `ErrorEnvelope`
     whose `error.code` maps to exactly one HTTP status:
@@ -32,7 +36,7 @@ info:
     Exceeding a size limit returns 413 `payload_too_large`; exceeding a count limit returns
     400 `invalid_request`.
 
-    All routes require a bearer API key except `GET /v1/health`.
+    All routes require a bearer API key except `GET /v1/health` and `GET /healthz`.
 servers:
   - url: http://127.0.0.1:{port}
     variables:
@@ -216,6 +220,9 @@ paths:
         KServe V2-style readiness rolled up across backends. `ok` when every backend is ok,
         `degraded` when at least one (but not all) is down, `down` when none is usable.
         Returns 200 for `ok` and `degraded`, 503 for `down`. No authentication.
+        Every distinct backend in the registry is probed once. `backends.text` and `backends.image`
+        report the backends of the default models; `models` reports the backend status of every
+        served model by id.
       security: []
       responses:
         "200":
@@ -231,6 +238,11 @@ paths:
                     backends:
                       text: {status: ok, latency_ms: 3}
                       image: {status: ok, latency_ms: 2}
+                    models:
+                      laya-english: {status: ok, latency_ms: 3}
+                      laya-multilingual: {status: ok, latency_ms: 3}
+                      laya-typed-decisions: {status: ok, latency_ms: 3}
+                      siglip2-base-patch16-224: {status: ok, latency_ms: 2}
         "503":
           description: No backend is usable.
           content:
@@ -244,6 +256,30 @@ paths:
                     backends:
                       text: {status: down}
                       image: {status: down}
+                    models:
+                      laya-english: {status: down}
+                      laya-multilingual: {status: down}
+                      laya-typed-decisions: {status: down}
+                      siglip2-base-patch16-224: {status: down}
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: liveness
+      summary: Process liveness (public, for Kubernetes probes).
+      description: |
+        Answers 200 as long as the proxy process is serving HTTP. It calls no backend and needs
+        no authentication; use `GET /v1/health` for backend readiness.
+      security: []
+      responses:
+        "200":
+          description: The proxy is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Liveness"
+              examples:
+                ok:
+                  value: {status: ok}
   /v1/models:
     get:
       tags: [ops]
@@ -403,10 +439,12 @@ components:
         model:
           type: string
           description: |
-            Optional Laya checkpoint pin: `english`, `multilingual`, or `typed-decisions`
-            (Laya aliases such as `en`, `multi`, `typed` are accepted). When omitted, Laya routes
-            automatically by script/language (see `meta.routing`). Unknown pins return 400.
-          examples: [english, multilingual, typed-decisions]
+            Optional text model: a `text-decision` id from `GET /v1/models` (for example
+            `laya-english`), or a Laya checkpoint name `english`, `multilingual`, `typed-decisions`
+            (Laya aliases such as `en`, `multi`, `typed` are accepted), which selects `laya-<checkpoint>`.
+            When omitted, the default text model serves the request and Laya routes automatically by
+            script/language (see `meta.routing`). Unknown models, and models of another task, return 400.
+          examples: [laya-english, english, multilingual, typed-decisions]
         min_confidence:
           type: number
           minimum: 0
@@ -634,6 +672,12 @@ components:
             Pad (not crop) the image onto a white square before resizing to 224x224. Padding keeps the
             aspect ratio, but it spreads probability on tall document images such as receipts, so it is
             off by default. Turn it on for images where squashing distorts the subject.
+        model:
+          type: string
+          description: |
+            Optional `image-zero-shot` model id from `GET /v1/models`. When omitted, the default image
+            model serves the request. Unknown models, and models of another task, return 400.
+          examples: [siglip2-base-patch16-224]
     ImageClassifyEnvelope:
       allOf:
         - $ref: "#/components/schemas/Envelope"
@@ -672,9 +716,19 @@ components:
         backends:
           type: object
           required: [text, image]
+          description: Backends of the default text and image models.
           properties:
             text: {$ref: "#/components/schemas/BackendHealth"}
             image: {$ref: "#/components/schemas/BackendHealth"}
+        models:
+          type: object
+          description: Model id -> status of the backend serving it (every model in `GET /v1/models`).
+          additionalProperties: {$ref: "#/components/schemas/BackendHealth"}
+    Liveness:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, const: ok}
     Model:
       type: object
       required: [id, task, backend, version]
@@ -685,7 +739,8 @@ components:
           enum: [text-decision, image-zero-shot]
         backend:
           type: string
-          examples: [laya, siglip2]
+          description: Backend kind (the registry entry's label, by default its adapter).
+          examples: [laya, siglip2, zero-shot-image]
         version:
           type: string
           description: Backend package version or pinned model commit.
