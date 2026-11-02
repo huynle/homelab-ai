@@ -29,6 +29,12 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 - `adapters.py`: one class per backend type (`laya`, `zero-shot-image`): backend call, response mapping
   and backend error mapping
 - `config.py`: `Settings.from_env()` and API key loading
+- `keystore.py`: the key stores (`FileKeyStore`, `SqliteKeyStore`), key format, HMAC hashing; see
+  [Key store](#key-store)
+- `db.py`, `migrations/`: SQLite connection settings and forward-only numbered migrations (SQLite mode only)
+- `keyservice.py`: the service layer of the [admin API](../../api/admin-api.yaml) (keys, members, usage and
+  audit queries with the owner/member rules). No HTTP routes yet
+- `usage.py`: the in-memory per-key daily usage aggregator and its flush to SQLite
 - `metrics.py`: Prometheus metrics (per-app registry) and the separate metrics HTTP server
 - `registry.example.yaml`: registry for the `ml` backends on the LAN
 - `Dockerfile`: container image (non-root, listens on `0.0.0.0:8080`)
@@ -53,6 +59,11 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 | `METRICS_HOST` | same as `HOST` | Bind address of the metrics server |
 | `METRICS_PORT` | `9090` | Port of the metrics server (`GET /metrics`) |
 | `BACKEND_PROBE_INTERVAL_S` | `30` | Period of the background backend health probe that refreshes `decision_api_backend_up`; `0` disables it |
+| `KEYSTORE` | `file` | `file`: keys from the variables above, nothing written. `sqlite`: the [SQLite key store](#key-store) (opt-in) |
+| `DECISION_API_DB_PATH` | unset | SQLite mode: database file; its directory must exist and be writable |
+| `DECISION_API_KEY_PEPPER_FILE` | unset | SQLite mode: file with the HMAC pepper, at least 32 bytes (surrounding whitespace is stripped) |
+| `DECISION_API_OWNER_EMAILS` | unset | SQLite mode: comma-separated owner emails (lowercased); the first one owns imported keys |
+| `DECISION_API_USAGE_FLUSH_S` | `15` | SQLite mode: seconds between usage flushes to the database (also flushed on shutdown) |
 
 Used only when `DECISION_API_REGISTRY_FILE` is unset (the pre-registry setup, still the default):
 
@@ -66,8 +77,9 @@ Used only when `DECISION_API_REGISTRY_FILE` is unset (the pre-registry setup, st
 | `IMAGE_MODEL_ID` | `siglip2-base-patch16-224` | `model` in image responses and `/v1/models` |
 | `IMAGE_MODEL_VERSION` | `75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2` | Fallback when the backend sends no `model_version` |
 
-The proxy refuses to start when no key is configured or the registry is invalid; it prints one line saying
-why and exits with status 1.
+The proxy refuses to start when no key is configured (file mode), the registry is invalid, or, with
+`KEYSTORE=sqlite`, the pepper is missing or shorter than 32 bytes, the database directory is missing or no
+owner email is set; it prints one line saying why and exits with status 1.
 
 ## Backend registry
 
@@ -136,6 +148,65 @@ chmod 600 /etc/decision-api/keys   # the proxy logs a warning if group/others ca
 Add one key per caller, with a `# comment` line above it to name it. Keys must not contain `#`. To revoke a
 key, delete its line and restart the proxy. Callers send `Authorization: Bearer <key>`. Keys are compared
 in constant time (`hmac.compare_digest`) against every configured key.
+
+## Key store
+
+`KEYSTORE` selects where valid keys come from. **The default is `file` and stays the default** until the
+deployment has a persistent volume for the database.
+
+- **`file` (default).** The keys from `DECISION_API_KEYS_FILE` / `DECISION_API_KEYS`, compared in constant
+  time against every key. No database is opened and nothing is written. Behaviour is the same as before the
+  SQLite store; `DECISION_API_DB_PATH` and the other SQLite variables are ignored unless `KEYSTORE=sqlite`.
+- **`sqlite` (opt-in).** Keys live in SQLite and are managed through the admin API (the HTTP routes and
+  Google sign-in come later; `keyservice.py` is the service layer). At startup the proxy opens the
+  database, applies pending migrations, makes the `DECISION_API_OWNER_EMAILS` owners, and imports every key
+  from the key file as an owner key (`source: imported`, name `imported (SOPS)`, `imported (SOPS) 2`, ...,
+  prefix `imported…`). The import is idempotent: a key already stored, even revoked, is skipped, so revoking
+  the imported key sticks across restarts. The key file stays the break-glass source: switching back to
+  `KEYSTORE=file` serves its keys again. Every request needs a key in this mode (`DECISION_API_ALLOW_NO_AUTH`
+  is ignored).
+
+Issued keys look like `dk_<public_id>_<secret>`: `public_id` is 12 lowercase base32 characters (`a-z`,
+`2-7`) and is the key's id; `secret` is 32 random bytes, base64url without padding (43 characters). The
+database stores only `HMAC-SHA256(pepper, key)` (hex), never the key; the full key is returned once, when it
+is created. Authentication looks the key up by its public id and compares the HMAC with
+`hmac.compare_digest`; imported keys (no public id in their value) are looked up by their HMAC. Revoked keys
+and keys whose `expires_at` has passed fail with the same 401 as unknown keys. Active keys are cached in
+memory and the cache is reloaded after every write to the database (the proxy runs one replica), so a
+revoke takes effect on the next request.
+
+Rules enforced by the service layer (see [`admin-api.yaml`](../../api/admin-api.yaml)): names 1-64
+characters; members hold at most 20 active keys (the owner has no limit); `expires_at` is optional, in the
+future and at most 730 days ahead; revoke is soft and idempotent (no second audit entry); removing a member
+revokes their active keys and deletes their sessions in one transaction; members see only their own keys
+and usage (another user's key is `not_found`, another `user` filter is `forbidden`); usage ranges are UTC
+dates, both inclusive, default the last 30 days, at most 366 days.
+
+**Usage.** For requests that presented a valid key, the proxy adds one count per (UTC day, key, route
+template, model) in memory: requests, client errors (4xx), server errors (5xx) and total latency. The
+counts go to `usage_daily` every `DECISION_API_USAGE_FLUSH_S` seconds and on shutdown; a failed flush keeps
+its counts for the next one. `last_used_at` is written by the same flush, at most once a minute per key.
+Requests without a resolved model are stored with model `''` and reported as `null`. In file mode no usage
+is recorded (the Prometheus metrics are unchanged in both modes).
+
+**Logs and metrics.** `key_id` in the access log and the `key_id` metric label is the public id for issued
+keys and the 8-hex sha256 prefix for file and imported keys, as before.
+
+**Schema** (`migrations/0001_initial.sql`): `users` (email, role `owner|member`, invited by/at, removed at,
+last sign-in), `api_keys` (public id, unique key HMAC, name, owner, source `issued|imported`, prefix,
+created/expires/revoked/last-used times, reserved `rate_limit_rpm`), `usage_daily` (primary key day, key,
+route, model), `sessions` (hashed id and CSRF token, expiry) and `audit` (time, actor, event, target, key
+id, JSON detail; no IP addresses or tokens). Connections use WAL, `foreign_keys=ON` and a 5 s busy timeout.
+
+**Migrations are forward-only.** Files are `migrations/NNNN_name.sql`, numbered from `0001` without gaps,
+and each runs once in its own transaction, recorded in `schema_version`. Never edit a migration that has
+shipped: add the next number. There are no down migrations, and the proxy refuses to start on a database
+whose schema is newer than its code (roll back by restoring a backup, not by downgrading).
+
+**Backup.** Back the database up with SQLite's online backup API (for example `sqlite3 "$DB" ".backup
+/backup/decision-api.db"`), which is safe while the proxy writes in WAL mode; this is what the k3s-backup
+CronJob pattern does. Do not copy the database file alone: the `-wal` file holds recent commits. The pepper
+is not in the database; without it, stored keys cannot be checked, so back it up with the other secrets.
 
 ## Run
 
@@ -210,7 +281,8 @@ The key file must be readable by uid 10001 inside the container (in Kubernetes, 
 - **Liveness.** `GET /healthz` returns `{"status": "ok"}` without auth or backend calls, and is not written
   to the access log (kubelet probes would flood it).
 - **Logging.** The proxy writes one JSON access line per request, with `method`, `path`, `status`,
-  `latency_ms` and `key_id`. `key_id` is the first 8 hex characters of the key's sha256. Keys, request
+  `latency_ms` and `key_id`. `key_id` is the first 8 hex characters of the key's sha256 (for issued
+  `dk_` keys in SQLite mode, the key's public id). Keys, request
   bodies and query strings are never logged, and the client's `Authorization` header is never forwarded to
   the backends. Uvicorn's own access log is turned off. The FastAPI `/docs` and `/openapi.json` endpoints
   are disabled; the YAML file is the contract.
@@ -239,8 +311,8 @@ Labels:
   Any other path is `other`, so scanners cannot create new series.
 - `model`: the registry id that served the request (for Laya without `model`, the checkpoint it routed to),
   or `none` when no model was resolved (401, 400 before model resolution, health, models).
-- `code`: the HTTP status. `key_id`: the same 8-hex sha256 prefix as the access log, `none` without a valid
-  key. Raw keys, emails and request bodies never appear in labels.
+- `code`: the HTTP status. `key_id`: the same value as the access log (8-hex sha256 prefix, or the public id
+  of an issued key), `none` without a valid key. Raw keys, emails and request bodies never appear in labels.
 - `error_code`: the contract error code of a failed backend call (`backend_unavailable`, `backend_timeout`,
   `backend_error`, `invalid_request` for a backend 4xx, `internal_error`).
 - `version`: the proxy/contract version (`1.1.0`); `registry_models`: comma-separated registry ids.
