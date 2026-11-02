@@ -1,0 +1,63 @@
+/* Decision API admin page. No external fonts or assets. Colours meet WCAG AA contrast on white. */
+:root {
+  --fg: #1a1a1a;
+  --muted: #555;
+  --bg: #fff;
+  --line: #ccc;
+  --accent: #0b57d0;
+  --danger: #a50e0e;
+  --ok: #146c2e;
+  --focus: #b45309;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+main { max-width: 72rem; margin: 0 auto; padding: 1rem 1.25rem 3rem; }
+header { border-bottom: 1px solid var(--line); padding: 0.5rem 1.25rem; }
+nav { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; }
+nav ul { list-style: none; display: flex; flex-wrap: wrap; gap: 1rem; margin: 0; padding: 0; }
+nav a[aria-current="page"] { font-weight: 700; text-decoration-thickness: 3px; }
+.who { margin: 0; color: var(--muted); }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+.skip { position: absolute; left: -999px; }
+.skip:focus { left: 1rem; top: 1rem; background: var(--bg); padding: 0.5rem; z-index: 1; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+.muted, .hint { color: var(--muted); }
+.button, button {
+  display: inline-block;
+  font: inherit;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  text-decoration: none;
+}
+button.danger { background: var(--bg); color: var(--danger); border-color: var(--danger); }
+input, select { font: inherit; padding: 0.3rem 0.4rem; border: 1px solid #767676; border-radius: 4px; }
+label { margin-right: 0.25rem; }
+form.rename { display: inline-flex; gap: 0.25rem; }
+form.rename input { width: 12rem; }
+.filter { margin: 1rem 0; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+caption { text-align: left; font-weight: 700; padding-bottom: 0.25rem; }
+th, td { border-bottom: 1px solid var(--line); padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; word-break: break-all; }
+.status-active { color: var(--ok); font-weight: 600; }
+.status-revoked, .status-expired { color: var(--danger); font-weight: 600; }
+.new-key { border: 2px solid var(--focus); border-radius: 4px; padding: 0.5rem 1rem; margin: 1rem 0; }
+#status.error { color: var(--danger); }
+.chart { display: block; max-width: 100%; height: auto; margin: 0.5rem 0; border-bottom: 1px solid var(--line); }
+.chart .bar { fill: var(--accent); }

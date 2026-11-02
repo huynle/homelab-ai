@@ -30,6 +30,7 @@ __all__ = ["Metrics", "generate_latest", "start_metrics_server"]
 PREFIX = "decision_api"
 NONE = "none"
 OTHER_ROUTE = "other"
+ADMIN_ROUTE = "admin"
 
 # 10 ms .. 10 s (the default backend timeout), roughly 1-2.5-5 steps
 REQUEST_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
@@ -38,9 +39,10 @@ REQUEST_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 class Metrics:
     """All proxy metrics, registered on one per-app registry."""
 
-    def __init__(self, routes: Iterable[str], version: str, model_ids: Iterable[str]):
+    def __init__(self, routes: Iterable[str], version: str, model_ids: Iterable[str], admin: bool = False):
         self.registry = CollectorRegistry(auto_describe=True)
         self.routes = frozenset(routes)
+        self.admin = admin  # admin page on: every /admin path is labelled ADMIN_ROUTE
         reg = self.registry
         ProcessCollector(registry=reg)
         PlatformCollector(registry=reg)
@@ -87,6 +89,8 @@ class Metrics:
         self.build_info.labels(version=version, registry_models=",".join(model_ids)).set(1)
 
     def route(self, path: str) -> str:
+        if self.admin and (path == "/admin" or path.startswith("/admin/")):
+            return ADMIN_ROUTE
         return path if path in self.routes else OTHER_ROUTE
 
     def observe_request(self, path: str, model: str | None, code: int, key_id: str | None, seconds: float) -> None:

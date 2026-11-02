@@ -201,3 +201,16 @@ def owner_db(db, clock):
     ks.invite_member(db, owner, ALICE, now=clock())
     ks.invite_member(db, owner, BOB, now=clock())
     return db
+
+
+# ---------------------------------------------------------------- admin page (Google sign-in)
+
+
+@pytest.fixture
+def admin(tmp_path, backends, clock):
+    """SQLite mode with sign-in configured; Google is faked (no network). See tests/adminkit.py."""
+    from adminkit import make_admin
+
+    a = make_admin(tmp_path, backends, clock)
+    yield a
+    a.close()

@@ -10,6 +10,7 @@ model backends listed in its [backend registry](#backend-registry):
 | `GET /v1/health` | `GET {backend_url}/health` once per distinct backend (public, no auth) |
 | `GET /v1/models` | the registry entries |
 | `GET /healthz` | none: process liveness for Kubernetes (public, no auth, not access-logged) |
+| `/admin`, `/admin/api/*`, `/admin/auth/*` | the [admin page](#admin-page) (off by default; 404 unless enabled) |
 
 Prometheus metrics are served on a separate, internal-only port (default `9090`); see [Metrics](#metrics).
 
@@ -33,7 +34,13 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
   [Key store](#key-store)
 - `db.py`, `migrations/`: SQLite connection settings and forward-only numbered migrations (SQLite mode only)
 - `keyservice.py`: the service layer of the [admin API](../../api/admin-api.yaml) (keys, members, usage and
-  audit queries with the owner/member rules). No HTTP routes yet
+  audit queries with the owner/member rules), used by `admin.py`
+- `admin.py`: the [admin page](#admin-page): activation and config checks, the sign-in routes, sessions and CSRF
+  checks, the JSON API of [`admin-api.yaml`](../../api/admin-api.yaml), the HTML pages and security headers
+- `oidc.py`: Google OIDC (PKCE S256, `state`, `nonce`), the signed login cookie, ID token verification with a
+  cached JWKS
+- `sessions.py`: server-side admin sessions (only hashes stored) and their CSRF tokens
+- `admin_pages.py`, `admin_static/`: server-rendered HTML (escaped, no inline code) and the page's JS and CSS
 - `usage.py`: the in-memory per-key daily usage aggregator and its flush to SQLite
 - `metrics.py`: Prometheus metrics (per-app registry) and the separate metrics HTTP server
 - `registry.example.yaml`: registry for the `ml` backends on the LAN
@@ -43,6 +50,8 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 - `tests/`: pytest suite. Backends are mocked with `httpx.MockTransport` using the real captures in
   `api/fixtures/`, so the tests make no network calls. `tests/test_contract.py` validates responses against
   the OpenAPI component schemas with `jsonschema`, so the proxy and the contract cannot drift apart.
+  `tests/test_admin.py` and `tests/test_admin_contract.py` cover the admin page against a fake Google
+  (`tests/fakegoogle.py`: a local RSA key, its JWKS and a token endpoint on `httpx.MockTransport`).
 
 ## Environment
 
@@ -64,6 +73,10 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 | `DECISION_API_KEY_PEPPER_FILE` | unset | SQLite mode: file with the HMAC pepper, at least 32 bytes (surrounding whitespace is stripped) |
 | `DECISION_API_OWNER_EMAILS` | unset | SQLite mode: comma-separated owner emails (lowercased); the first one owns imported keys |
 | `DECISION_API_USAGE_FLUSH_S` | `15` | SQLite mode: seconds between usage flushes to the database (also flushed on shutdown) |
+| `DECISION_API_OAUTH_CLIENT_ID` | unset | [Admin page](#admin-page): Google OAuth client id |
+| `DECISION_API_OAUTH_CLIENT_SECRET_FILE` | unset | Admin page: file with the Google OAuth client secret |
+| `DECISION_API_PUBLIC_URL` | unset | Admin page: the public https origin, `https://decide.ai.huynle.com`; the redirect URI is this plus `/admin/auth/callback` |
+| `DECISION_API_SESSION_KEY_FILE` | unset | Admin page: file with the session key (at least 32 bytes, not the pepper); signs the login cookie and derives CSRF tokens |
 
 Used only when `DECISION_API_REGISTRY_FILE` is unset (the pre-registry setup, still the default):
 
@@ -79,7 +92,8 @@ Used only when `DECISION_API_REGISTRY_FILE` is unset (the pre-registry setup, st
 
 The proxy refuses to start when no key is configured (file mode), the registry is invalid, or, with
 `KEYSTORE=sqlite`, the pepper is missing or shorter than 32 bytes, the database directory is missing or no
-owner email is set; it prints one line saying why and exits with status 1.
+owner email is set, or the admin page is [partly configured](#admin-page); it prints one line saying why and
+exits with status 1.
 
 ## Backend registry
 
@@ -157,8 +171,8 @@ deployment has a persistent volume for the database.
 - **`file` (default).** The keys from `DECISION_API_KEYS_FILE` / `DECISION_API_KEYS`, compared in constant
   time against every key. No database is opened and nothing is written. Behaviour is the same as before the
   SQLite store; `DECISION_API_DB_PATH` and the other SQLite variables are ignored unless `KEYSTORE=sqlite`.
-- **`sqlite` (opt-in).** Keys live in SQLite and are managed through the admin API (the HTTP routes and
-  Google sign-in come later; `keyservice.py` is the service layer). At startup the proxy opens the
+- **`sqlite` (opt-in).** Keys live in SQLite and are managed through the [admin page](#admin-page) once it is
+  configured (`keyservice.py` is the service layer). At startup the proxy opens the
   database, applies pending migrations, makes the `DECISION_API_OWNER_EMAILS` owners, and imports every key
   from the key file as an owner key (`source: imported`, name `imported (SOPS)`, `imported (SOPS) 2`, ...,
   prefix `imported…`). The import is idempotent: a key already stored, even revoked, is skipped, so revoking
@@ -207,6 +221,123 @@ whose schema is newer than its code (roll back by restoring a backup, not by dow
 /backup/decision-api.db"`), which is safe while the proxy writes in WAL mode; this is what the k3s-backup
 CronJob pattern does. Do not copy the database file alone: the `-wal` file holds recent commits. The pepper
 is not in the database; without it, stored keys cannot be checked, so back it up with the other secrets.
+
+## Admin page
+
+`https://decide.ai.huynle.com/admin`: Google sign-in, API keys, usage, members and the audit log, as specified
+in [`api/admin-api.yaml`](../../api/admin-api.yaml) (design: ADR 0033 in `huynle/infra`).
+
+### Activation
+
+The admin page exists only when **`KEYSTORE=sqlite`** and **all four** of `DECISION_API_OAUTH_CLIENT_ID`,
+`DECISION_API_OAUTH_CLIENT_SECRET_FILE`, `DECISION_API_PUBLIC_URL` and `DECISION_API_SESSION_KEY_FILE` are set
+and valid. In every other case no admin route is registered and **every `/admin` path answers 404**, with or
+without a key, so the default production setup (`KEYSTORE=file`) has no sign-in page at all. `/v1`, `/healthz`
+and the metrics behave the same with the admin page on or off.
+
+- `KEYSTORE=file`: the four variables are ignored (a warning is logged if any is set).
+- `KEYSTORE=sqlite` with none of them: admin page off (logged at startup).
+- `KEYSTORE=sqlite` with some of them, an unreadable or empty secret file, a session key shorter than 32 bytes
+  or equal to the pepper, or a `DECISION_API_PUBLIC_URL` that is not a bare `https://host` origin: the proxy
+  refuses to start.
+
+### Setup
+
+1. **OAuth client.** In GCP project `huynle-infra`, create an OAuth client of type *Web application* with the
+   authorized redirect URI exactly `https://decide.ai.huynle.com/admin/auth/callback` (the app sends
+   `DECISION_API_PUBLIC_URL` + `/admin/auth/callback`; Google requires an exact match). The consent screen
+   stays in **Testing** mode.
+2. **Secrets** (SOPS in infra, mounted as files readable by uid 10001): the client secret, and a fresh session
+   key, for example `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`. The session key must not
+   be the key pepper. Rotating it ends every session (their CSRF tokens no longer match) and invalidates
+   pending logins.
+3. **Env:** `KEYSTORE=sqlite` and its variables (see [Key store](#key-store)), `DECISION_API_OWNER_EMAILS` (the
+   owner), plus the four variables above.
+4. **Egress:** the pod calls `https://oauth2.googleapis.com/token` (code exchange) and
+   `https://www.googleapis.com/oauth2/v3/certs` (Google's signing keys) over TCP 443, with 5 s connect and 10 s
+   overall timeouts. The browser, not the pod, talks to `accounts.google.com`.
+
+### Owner and members
+
+- The owner is the email in `DECISION_API_OWNER_EMAILS` (config, not the database). The owner sees and revokes
+  every key, sees all usage, invites and removes members and reads the audit log.
+- **Invite flow.** The owner invites an email on *Members* (`POST /admin/api/members`). No email is sent. Because
+  the consent screen is in Testing mode, the owner must **also add the address as a test user** in the GCP
+  consent screen of `huynle-infra` (at most 100), or Google refuses the sign-in; the invite form says so.
+  Then the member signs in at `/admin` with that Google account and creates their own keys.
+- Removing a member (owner only) revokes their active keys and ends their sessions at once; their keys and
+  usage stay visible to the owner. Remove the GCP test user as a separate step.
+
+### Sign-in
+
+Authorization code flow with PKCE (S256), `state` and `nonce`, scope `openid email profile`,
+`prompt=select_account`.
+
+1. `GET /admin/auth/login?next=/admin/...` makes a random `state`, `nonce` and PKCE verifier and stores them,
+   with `next`, in the `__Host-decision_oauth` cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`,
+   `Max-Age=600`), signed with HMAC-SHA256 under the session key. `next` must be a path under `/admin`
+   (anything else becomes `/admin`). Then it redirects to Google.
+2. `GET /admin/auth/callback` clears that cookie in every case, then checks `state` (constant time), exchanges
+   the code with the verifier, and verifies the ID token: RS256 signature against Google's JWKS (cached for an
+   hour; an unknown `kid` refetches it, at most once a minute), `iss` `https://accounts.google.com` or
+   `accounts.google.com`, `aud` (and `azp`) the client id, `exp`/`iat` with 60 s leeway, `nonce`, and
+   `email_verified: true`. The email (lowercased) must be the owner or an invited, not removed member.
+   Failures show an HTML page (400 for a stale/forged callback or an unverifiable token, 403 for an account
+   that is not allowed, without saying why) and are audited as `sign_in.denied` with the reason.
+3. On success the proxy creates a server-side session, sets `__Host-decision_session` (`HttpOnly`, `Secure`,
+   `SameSite=Lax`, `Path=/`, no `Domain`, `Max-Age=43200`), records the sign-in time, audits
+   `sign_in.allowed` and redirects to `next`.
+
+`X-Forwarded-User` and other identity headers are never read.
+
+### Sessions and CSRF
+
+- The cookie holds a random 32-byte id; the `sessions` table stores only its sha256 and the sha256 of the
+  session's CSRF token. Sessions end 12 hours after sign-in (not sliding), on sign-out
+  (`POST /admin/auth/logout`, 204) and when the member is removed. A session is accepted only while its user is
+  still the owner or an active member, and the role is read from the database on every request.
+- The CSRF token is HMAC-SHA256(session key, session id). `GET /admin/api/me` returns it and HTML pages embed it
+  in `<meta name="csrf-token">`. `POST`, `PATCH` and `DELETE` need `X-CSRF-Token` (compared in constant time
+  against the stored hash) **and** `Origin` equal to `DECISION_API_PUBLIC_URL`; any `/admin/api` request with
+  a foreign `Origin` is refused too. Failures are 403 `csrf_failed`.
+- The JSON API never redirects: without a session it answers 401 `unauthorized`. Errors use
+  `{"error": {"code", "message"}}`. Bodies are JSON objects of at most 16 KiB and unknown fields are 400.
+- **Separation from `/v1`.** Bearer API keys never authenticate `/admin` (the key check is skipped there and
+  the admin routes read only the session cookie), and the session cookie never authenticates `/v1`.
+
+### Pages
+
+Server-rendered HTML; the only script is `/admin/static/admin.js`, which calls the JSON API. Viewing works
+without JavaScript; creating, renaming and revoking keys and managing members need it (one CSRF mechanism, the
+header).
+
+- `/admin`: signed out, a *Sign in with Google* link; signed in, your keys (name, prefix, created, expires,
+  last used, status) with rename and revoke (confirmed), a create form (name, optional expiry date: the key
+  stops at 23:59:59 UTC that day) that shows the new key once with a copy button, and a 30-day usage chart
+  (inline SVG) and table of your keys.
+- Owner only (members get 403, signed-out visitors are sent to sign-in): `/admin/keys` (all keys, filter by
+  user), `/admin/usage` (all users, by day and by key, filter by user and dates), `/admin/members` (invite,
+  remove) and `/admin/audit` (newest first, paged).
+
+### Security notes
+
+- Every `/admin` response carries `Content-Security-Policy: default-src 'self'; script-src 'self';
+  style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none';
+  base-uri 'none'; object-src 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy` and `Cross-Origin-Resource-Policy: same-origin`,
+  `Strict-Transport-Security`, and `Cache-Control: no-store` (static files: `no-cache`). Pages have no inline
+  scripts, styles or handlers and load nothing from other origins; every value is HTML-escaped.
+- `/admin` is public only for `/admin` (signed-out view), `/admin/auth/login`, `/admin/auth/callback` and
+  `/admin/static/admin.js|admin.css` (a fixed list loaded at startup). Every other admin route needs a session;
+  `tests/test_admin.py` checks each `/admin/api` route against signed-out, bearer-key-only and cross-site
+  requests, and that the served routes match the contract.
+- Audit entries hold emails, key ids and a reason; never IP addresses, tokens or keys. A full key appears only
+  in the `201` response that creates it.
+- **Usage and metrics.** `/admin` traffic is never usage: usage is recorded only for requests that presented a
+  valid bearer key on the API routes. In metrics every admin path is `route="admin"`, `key_id="none"`. The access
+  log writes `/admin/api/members/{email}` instead of the member's email.
+- Local testing needs https on the public origin (the cookies are `Secure` and `__Host-`); the tests use
+  `https://decide.ai.huynle.com` as the test client's base URL and fake Google with a local RSA key.
 
 ## Run
 
@@ -308,7 +439,8 @@ The proxy runs as a single uvicorn process, so no multiprocess mode is used.
 Labels:
 
 - `route`: the route template (`/v1/decide/text`, `/v1/classify/image`, `/v1/health`, `/v1/models`).
-  Any other path is `other`, so scanners cannot create new series.
+  Any other path is `other`, so scanners cannot create new series. With the admin page on, every `/admin`
+  path is the single value `admin` (with `key_id="none"`: bearer keys are never checked there).
 - `model`: the registry id that served the request (for Laya without `model`, the checkpoint it routed to),
   or `none` when no model was resolved (401, 400 before model resolution, health, models).
 - `code`: the HTTP status. `key_id`: the same value as the access log (8-hex sha256 prefix, or the public id
