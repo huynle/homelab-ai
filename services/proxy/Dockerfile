@@ -1,0 +1,30 @@
+# Decision API proxy. Build from services/proxy:  docker build -t decision-api services/proxy
+#
+# Base: python:3.12-slim (3.12.16-slim-trixie), multi-arch index digest resolved from Docker Hub on 2026-11-02.
+# Bump the tag and digest together.
+FROM python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOST=0.0.0.0 \
+    PORT=8080
+
+WORKDIR /app
+
+# All runtime dependencies ship as wheels, so no compiler or build packages are needed.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app
+
+COPY app.py adapters.py config.py errors.py models.py registry.py ./
+
+# Mount secrets and config at runtime, e.g.
+#   DECISION_API_KEYS_FILE=/etc/decision-api/keys/keys
+#   DECISION_API_REGISTRY_FILE=/etc/decision-api/registry.yaml
+USER 10001:10001
+EXPOSE 8080
+
+# Liveness: GET /healthz. Readiness: GET /v1/health (503 when every backend is down).
+CMD ["python", "app.py"]
