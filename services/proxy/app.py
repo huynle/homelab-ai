@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import hmac
 import json
@@ -21,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+import metrics
 from adapters import ADAPTERS, Call, Result
 from config import Settings
 from errors import ApiError, error_response
@@ -42,6 +44,7 @@ TEXT_BODY_LIMIT = 64 * 1024
 IMAGE_BODY_LIMIT = 12 * 1024 * 1024
 LIVENESS_PATH = "/healthz"
 PUBLIC_PATHS = {"/v1/health", LIVENESS_PATH}
+APP_VERSION = "1.1.0"
 
 
 def _ms(start: float) -> float:
@@ -160,15 +163,61 @@ def create_app(
     if not auth_required:
         log.warning("DECISION_API_ALLOW_NO_AUTH=1: serving without authentication")
 
+    backend_urls = registry.backend_urls()
+
+    async def probe_backends(http: httpx.AsyncClient) -> dict[str, dict]:
+        """Probe every distinct backend once and update ``backend_up`` for each model behind it."""
+        probes = await asyncio.gather(*(probe(http, url, settings.health_timeout_s) for url in backend_urls))
+        by_url = dict(zip(backend_urls, probes, strict=True))
+        for m in registry.models:
+            mx.set_backend_up(m.id, by_url[m.backend_url]["status"] == "ok")
+        return by_url
+
+    async def probe_loop(http: httpx.AsyncClient, interval: float) -> None:
+        # The first probe waits one interval: readiness probes hit /v1/health (which also updates the gauge)
+        # right after start, and a short-lived process makes no surprise backend calls.
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await probe_backends(http)
+            except Exception as exc:  # never let the probe loop die
+                log.warning("periodic backend probe failed (%s)", type(exc).__name__)
+
+    def start_metrics_server():
+        if not settings.metrics_enabled:
+            return None
+        host = settings.metrics_host or settings.host
+        try:
+            server = metrics.start_metrics_server(host=host, port=settings.metrics_port, registry=mx.registry)
+        except Exception as exc:  # metrics are best effort: the API keeps serving without them
+            log.error("metrics server not started on %s:%s (%s)", host, settings.metrics_port, exc)
+            return None
+        log.info("metrics on http://%s:%s/metrics", host, settings.metrics_port)
+        return server
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False) as client:
-            app.state.http = client
-            yield
+        server = start_metrics_server()
+        try:
+            async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False) as client:
+                app.state.http = client
+                interval = settings.backend_probe_interval_s
+                task = asyncio.create_task(probe_loop(client, interval)) if interval > 0 else None
+                try:
+                    yield
+                finally:
+                    if task is not None:
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.shutdown)
+                server.server_close()
 
     app = FastAPI(
         title="Homelab Decision API",
-        version="1.1.0",
+        version=APP_VERSION,
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -182,7 +231,7 @@ def create_app(
     @app.middleware("http")
     async def access_and_auth(request: Request, call_next):
         start = request.state.start = time.perf_counter()
-        if request.url.path == LIVENESS_PATH:  # kubelet probes: no auth, no access-log noise
+        if request.url.path == LIVENESS_PATH:  # kubelet probes: no auth, no access-log noise, no metrics
             return await call_next(request)
         kid = None
         try:
@@ -209,6 +258,13 @@ def create_app(
                 }
             )
         )
+        mx.observe_request(
+            request.url.path,
+            getattr(request.state, "model", None),
+            response.status_code,
+            kid,
+            time.perf_counter() - start,
+        )
         return response
 
     def client(request: Request) -> httpx.AsyncClient:
@@ -216,8 +272,19 @@ def create_app(
 
     async def run(request: Request, task: str, data: dict, req) -> JSONResponse:
         entry, explicit = registry.resolve(task, req.model)
+        request.state.model = entry.id
         call = Call(client(request), entry, explicit, registry)
-        result: Result = await ADAPTERS[entry.adapter].run(call, data, req)
+        started = time.perf_counter()
+        try:
+            result: Result = await ADAPTERS[entry.adapter].run(call, data, req)
+        except ApiError as exc:
+            mx.observe_backend(entry.id, time.perf_counter() - started, exc.code)
+            raise
+        except Exception:
+            mx.observe_backend(entry.id, time.perf_counter() - started, "internal_error")
+            raise
+        mx.observe_backend(entry.id, time.perf_counter() - started)
+        request.state.model = result.model  # Laya may report the checkpoint it routed to
         return JSONResponse(
             {
                 "model": result.model,
@@ -259,14 +326,10 @@ def create_app(
             raise ApiError("invalid_request", "image.base64: not valid standard base64") from None
         return await run(request, IMAGE_TASK, data, req)
 
-    backend_urls = registry.backend_urls()
-
     @app.get("/v1/health")
     async def health(request: Request):
-        http = client(request)
-        probes = await asyncio.gather(*(probe(http, url, settings.health_timeout_s) for url in backend_urls))
-        by_url = dict(zip(backend_urls, probes, strict=True))
-        up = [p["status"] == "ok" for p in probes]
+        by_url = await probe_backends(client(request))
+        up = [p["status"] == "ok" for p in by_url.values()]
         status = "ok" if all(up) else "degraded" if any(up) else "down"
         return JSONResponse(
             {
@@ -290,6 +353,11 @@ def create_app(
     async def list_models():
         return {"models": models}
 
+    # Route templates for the `route` label; /healthz is excluded from request metrics like from the access log.
+    routes = [r.path for r in app.routes if getattr(r, "path", None) and r.path != LIVENESS_PATH]
+    mx = app.state.metrics = metrics.Metrics(
+        routes=routes, version=APP_VERSION, model_ids=[m.id for m in registry.models]
+    )
     return app
 
 

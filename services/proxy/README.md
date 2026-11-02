@@ -11,6 +11,8 @@ model backends listed in its [backend registry](#backend-registry):
 | `GET /v1/models` | the registry entries |
 | `GET /healthz` | none: process liveness for Kubernetes (public, no auth, not access-logged) |
 
+Prometheus metrics are served on a separate, internal-only port (default `9090`); see [Metrics](#metrics).
+
 ## Production
 
 Production runs this proxy on k3s behind `https://decide.ai.huynle.com` (namespace `decision-api`).
@@ -27,6 +29,7 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 - `adapters.py`: one class per backend type (`laya`, `zero-shot-image`): backend call, response mapping
   and backend error mapping
 - `config.py`: `Settings.from_env()` and API key loading
+- `metrics.py`: Prometheus metrics (per-app registry) and the separate metrics HTTP server
 - `registry.example.yaml`: registry for the `ml` backends on the LAN
 - `Dockerfile`: container image (non-root, listens on `0.0.0.0:8080`)
 - `models.py`: Pydantic request models and limits that mirror the spec's component schemas
@@ -46,6 +49,10 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 | `HOST` | `127.0.0.1` | Bind address (the container image sets `0.0.0.0`) |
 | `PORT` | `8080` | Bind port |
 | `HEALTH_TIMEOUT_S` | `2` | Per-backend timeout for the `/v1/health` probe |
+| `METRICS_ENABLED` | `1` | `0`/`false` starts no metrics server (metrics are still recorded in memory) |
+| `METRICS_HOST` | same as `HOST` | Bind address of the metrics server |
+| `METRICS_PORT` | `9090` | Port of the metrics server (`GET /metrics`) |
+| `BACKEND_PROBE_INTERVAL_S` | `30` | Period of the background backend health probe that refreshes `decision_api_backend_up`; `0` disables it |
 
 Used only when `DECISION_API_REGISTRY_FILE` is unset (the pre-registry setup, still the default):
 
@@ -207,6 +214,43 @@ The key file must be readable by uid 10001 inside the container (in Kubernetes, 
   bodies and query strings are never logged, and the client's `Authorization` header is never forwarded to
   the backends. Uvicorn's own access log is turned off. The FastAPI `/docs` and `/openapi.json` endpoints
   are disabled; the YAML file is the contract.
+
+## Metrics
+
+The proxy serves Prometheus metrics with `prometheus_client`'s own HTTP server, started in the app lifespan,
+on `METRICS_HOST:METRICS_PORT` (default `HOST:9090`; in the image `0.0.0.0:9090`). Scrape path: `/metrics`.
+The port is **internal only**: it is not exposed by the ingress (which routes only to the API port 8080) and
+is meant to be scraped in-cluster. The public API port never serves `/metrics` (it answers 401 without a
+key and 404 with one). If the metrics port cannot be bound, the proxy logs an error and keeps serving the API.
+The proxy runs as a single uvicorn process, so no multiprocess mode is used.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `decision_api_requests_total` | counter | `route`, `model`, `code`, `key_id` |
+| `decision_api_request_duration_seconds` | histogram | `route`, `model` |
+| `decision_api_backend_request_duration_seconds` | histogram | `model` |
+| `decision_api_backend_errors_total` | counter | `model`, `error_code` |
+| `decision_api_backend_up` | gauge | `model` |
+| `decision_api_build_info` | gauge (always 1) | `version`, `registry_models` |
+
+Labels:
+
+- `route`: the route template (`/v1/decide/text`, `/v1/classify/image`, `/v1/health`, `/v1/models`).
+  Any other path is `other`, so scanners cannot create new series.
+- `model`: the registry id that served the request (for Laya without `model`, the checkpoint it routed to),
+  or `none` when no model was resolved (401, 400 before model resolution, health, models).
+- `code`: the HTTP status. `key_id`: the same 8-hex sha256 prefix as the access log, `none` without a valid
+  key. Raw keys, emails and request bodies never appear in labels.
+- `error_code`: the contract error code of a failed backend call (`backend_unavailable`, `backend_timeout`,
+  `backend_error`, `invalid_request` for a backend 4xx, `internal_error`).
+- `version`: the proxy/contract version (`1.1.0`); `registry_models`: comma-separated registry ids.
+
+Durations use buckets from 10 ms to 10 s (`0.01 ... 10`). `backend_request_duration_seconds` includes failed
+calls (a timeout is observed at its timeout). `GET /healthz` is excluded from request metrics, as it is
+from the access log. `decision_api_backend_up` is 1/0 per model from the last health probe of its backend:
+every `GET /v1/health` (including readiness probes) updates it, and a background probe every
+`BACKEND_PROBE_INTERVAL_S` keeps it fresh without traffic (the first background probe runs one interval after
+start). The standard `process_*` and `python_*` collectors are included.
 
 ## Tests
 

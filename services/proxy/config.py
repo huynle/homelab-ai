@@ -35,6 +35,10 @@ class Settings:
     image_model_id: str = DEFAULT_IMAGE_MODEL_ID
     image_model_version: str = DEFAULT_IMAGE_MODEL_VERSION
     registry_file: str | None = None
+    metrics_enabled: bool = True
+    metrics_host: str | None = None  # None: same as host
+    metrics_port: int = 9090
+    backend_probe_interval_s: float = 30.0  # 0 disables the periodic backend probe
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -59,6 +63,10 @@ class Settings:
             image_model_id=get("IMAGE_MODEL_ID", d.image_model_id),
             image_model_version=get("IMAGE_MODEL_VERSION", d.image_model_version),
             registry_file=get("DECISION_API_REGISTRY_FILE", d.registry_file),
+            metrics_enabled=get("METRICS_ENABLED", "1").lower() in TRUTHY,
+            metrics_host=get("METRICS_HOST", d.metrics_host),
+            metrics_port=int(get("METRICS_PORT", d.metrics_port)),
+            backend_probe_interval_s=float(get("BACKEND_PROBE_INTERVAL_S", d.backend_probe_interval_s)),
         )
 
 

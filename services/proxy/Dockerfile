@@ -18,13 +18,15 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app
 
-COPY app.py adapters.py config.py errors.py models.py registry.py ./
+COPY app.py adapters.py config.py errors.py metrics.py models.py registry.py ./
 
 # Mount secrets and config at runtime, e.g.
 #   DECISION_API_KEYS_FILE=/etc/decision-api/keys/keys
 #   DECISION_API_REGISTRY_FILE=/etc/decision-api/registry.yaml
 USER 10001:10001
-EXPOSE 8080
+# 8080: the API (behind the ingress). 9090: Prometheus metrics (METRICS_PORT), internal only: scraped
+# in-cluster, never routed by the ingress.
+EXPOSE 8080 9090
 
 # Liveness: GET /healthz. Readiness: GET /v1/health (503 when every backend is down).
 CMD ["python", "app.py"]
