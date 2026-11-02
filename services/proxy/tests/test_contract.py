@@ -11,7 +11,10 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
 from app import create_app
-from conftest import API_DIR
+from config import Settings
+from conftest import API_DIR, API_KEY
+
+PROXY_DIR = API_DIR.parent / "services" / "proxy"
 
 SPEC_URI = "urn:decision-api"
 
@@ -92,3 +95,39 @@ def test_spec_request_examples_are_accepted(spec, backends, settings):
                 if "image" in body:
                     body = dict(body, image=dict(body["image"], base64="/9j/4AAQSkZJRgABAQAAAQABAAD/"))
                 assert c.post(path, json=body, headers=headers).status_code == 200, (path, body)
+
+
+def test_example_registry_models_match_spec_example(spec, backends, validate):
+    settings = Settings(api_keys=(API_KEY,), registry_file=str(PROXY_DIR / "registry.example.yaml"))
+    app = create_app(settings, transport=httpx.MockTransport(backends.handler))
+    with TestClient(app) as c:
+        body = c.get("/v1/models", headers={"Authorization": f"Bearer {API_KEY}"}).json()
+    validate(body, "ModelList")
+    example = spec["paths"]["/v1/models"]["get"]["responses"]["200"]["content"]["application/json"]["examples"]
+    assert body == example["current"]["value"]
+
+
+def test_image_request_may_name_a_model(image_request, validate):
+    validate(dict(image_request, model="siglip2-base-patch16-224"), "ImageClassifyRequest")
+
+
+def test_health_models_map_matches_schema(client, backends, spec, validate):
+    assert "models" in spec["components"]["schemas"]["HealthResponse"]["properties"]
+    body = client.get("/v1/health").json()
+    assert set(body["models"]) == {
+        "laya-english",
+        "laya-multilingual",
+        "laya-typed-decisions",
+        "siglip2-base-patch16-224",
+    }
+    validate(body, "HealthResponse")
+    with pytest.raises(AssertionError):
+        validate({"status": "ok", "backends": body["backends"], "models": {"x": {"status": "bogus"}}}, "HealthResponse")
+
+
+def test_healthz_matches_schema(client, spec, validate):
+    op = spec["paths"]["/healthz"]["get"]
+    assert op["security"] == []
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    validate(resp.json(), "Liveness")

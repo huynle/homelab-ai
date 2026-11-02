@@ -1,0 +1,20 @@
+# Only requirements.txt and the app modules are copied; keep everything else out of the build context.
+tests/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+*.key
+keys
+keys.*
+*.local.yaml
+requirements-dev.txt
+pytest.ini
+ruff.toml
+README.md
+Dockerfile
+.dockerignore

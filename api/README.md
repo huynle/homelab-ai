@@ -7,10 +7,15 @@ front of two local backends:
 |---|---|---|
 | `POST /v1/decide/text` | Laya (`laya[serve]` 0.4.20, `127.0.0.1:8000/predict`) | typed text decisions: `choice`, `score`, `noul` |
 | `POST /v1/classify/image` | SigLIP2 `google/siglip2-base-patch16-224` @ `75de2d55` | zero-shot image classification |
-| `GET /v1/health` | both | readiness (public, no auth) |
-| `GET /v1/models` | both | served models |
+| `GET /v1/health` | every backend | readiness (public, no auth) |
+| `GET /v1/models` | registry | served models |
+| `GET /healthz` | none | proxy liveness (public, no auth) |
 
-Every route except `GET /v1/health` requires `Authorization: Bearer <api-key>`.
+Every route except `GET /v1/health` and `GET /healthz` requires `Authorization: Bearer <api-key>`.
+
+The proxy reads the served models from a backend registry (`services/proxy/registry.example.yaml`). A
+request picks one with `model` (an id from `GET /v1/models`); without it, the registry's default model for
+the task is used. Text requests may still send a Laya checkpoint name such as `english`.
 
 ## Borrowed conventions
 

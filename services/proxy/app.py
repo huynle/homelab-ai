@@ -1,4 +1,4 @@
-"""Decision API proxy: one contract (api/decision-api.yaml) in front of Laya (text) and SigLIP2 (image).
+"""Decision API proxy: one contract (api/decision-api.yaml) in front of the model backends in the registry.
 
 Run with ``python app.py`` or ``uvicorn app:create_app --factory``.
 """
@@ -15,18 +15,16 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from adapters import ADAPTERS, Call, Result
 from config import Settings
 from errors import ApiError, error_response
 from models import (
-    DEFAULT_PAD_TO_SQUARE,
-    DEFAULT_TEMPLATE,
     MAX_IMAGE_B64_CHARS,
     MAX_IMAGE_BYTES,
     MAX_LABELS,
@@ -35,13 +33,15 @@ from models import (
     ImageClassifyRequest,
     TextDecisionRequest,
 )
+from registry import IMAGE_TASK, TEXT_TASK, Registry, load_registry, registry_from_settings
 
 log = logging.getLogger("decision_api")
 access_log = logging.getLogger("decision_api.access")
 
 TEXT_BODY_LIMIT = 64 * 1024
 IMAGE_BODY_LIMIT = 12 * 1024 * 1024
-PUBLIC_PATHS = {"/v1/health"}
+LIVENESS_PATH = "/healthz"
+PUBLIC_PATHS = {"/v1/health", LIVENESS_PATH}
 
 
 def _ms(start: float) -> float:
@@ -123,67 +123,6 @@ def _decoded_b64_len(s: str) -> int:
 # ---------------------------------------------------------------- backend calls
 
 
-def _backend_message(resp: httpx.Response) -> str:
-    try:
-        data = resp.json()
-    except ValueError:
-        return resp.text.strip()[:500] or f"HTTP {resp.status_code}"
-    if isinstance(data, dict):
-        detail = data.get("detail")
-        if isinstance(detail, str):
-            return detail
-        if isinstance(detail, list):
-            msgs = []
-            for item in detail[:5]:
-                if isinstance(item, dict):
-                    loc = ".".join(str(p) for p in item.get("loc", []))
-                    msgs.append(f"{loc}: {item.get('msg', '')}".strip(": "))
-                else:
-                    msgs.append(str(item))
-            return "; ".join(msgs)
-        err = data.get("error")
-        if isinstance(err, dict) and isinstance(err.get("message"), str):
-            return err["message"]
-        if isinstance(err, str):
-            return err
-        if isinstance(data.get("message"), str):
-            return data["message"]
-    return json.dumps(data)[:500]
-
-
-async def call_backend(
-    client: httpx.AsyncClient, name: str, url: str, payload: dict, timeout: float, **err_fields
-) -> dict:
-    """POST JSON to a backend and map every failure onto a contract error."""
-    netloc = urlsplit(url).netloc
-    try:
-        resp = await client.post(url, json=payload, timeout=timeout)
-    except (httpx.ConnectError, httpx.ConnectTimeout):
-        raise ApiError("backend_unavailable", f"{name} backend unreachable at {netloc}", **err_fields) from None
-    except httpx.TimeoutException:
-        raise ApiError(
-            "backend_timeout", f"{name} backend did not answer within {int(timeout * 1000)} ms", **err_fields
-        ) from None
-    except httpx.TransportError as exc:
-        raise ApiError(
-            "backend_error", f"{name} backend connection failed ({type(exc).__name__})", **err_fields
-        ) from None
-
-    if 400 <= resp.status_code < 500:
-        raise ApiError(
-            "invalid_request", f"{name} backend rejected the request: {_backend_message(resp)}", **err_fields
-        )
-    if resp.status_code != 200:
-        raise ApiError("backend_error", f"{name} backend returned HTTP {resp.status_code}", **err_fields)
-    try:
-        data = resp.json()
-    except ValueError:
-        data = None
-    if not isinstance(data, dict):
-        raise ApiError("backend_error", f"{name} backend returned an unparseable response", **err_fields)
-    return data
-
-
 async def probe(client: httpx.AsyncClient, url: str, timeout: float) -> dict:
     start = time.perf_counter()
     try:
@@ -204,8 +143,14 @@ async def probe(client: httpx.AsyncClient, url: str, timeout: float) -> dict:
 # ---------------------------------------------------------------- app
 
 
-def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    registry: Registry | None = None,
+) -> FastAPI:
     settings = Settings.from_env() if settings is None else settings
+    if registry is None:
+        registry = load_registry(settings.registry_file) if settings.registry_file else registry_from_settings(settings)
     if not settings.api_keys and not settings.allow_no_auth:
         raise RuntimeError(
             "no API keys configured: set DECISION_API_KEYS_FILE or DECISION_API_KEYS "
@@ -223,7 +168,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     app = FastAPI(
         title="Homelab Decision API",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -237,6 +182,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     @app.middleware("http")
     async def access_and_auth(request: Request, call_next):
         start = request.state.start = time.perf_counter()
+        if request.url.path == LIVENESS_PATH:  # kubelet probes: no auth, no access-log noise
+            return await call_next(request)
         kid = None
         try:
             if auth_required and request.url.path not in PUBLIC_PATHS:
@@ -267,6 +214,20 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     def client(request: Request) -> httpx.AsyncClient:
         return request.app.state.http
 
+    async def run(request: Request, task: str, data: dict, req) -> JSONResponse:
+        entry, explicit = registry.resolve(task, req.model)
+        call = Call(client(request), entry, explicit, registry)
+        result: Result = await ADAPTERS[entry.adapter].run(call, data, req)
+        return JSONResponse(
+            {
+                "model": result.model,
+                "model_version": result.model_version,
+                "latency_ms": _ms(request.state.start),
+                "results": result.results,
+                "meta": result.meta,
+            }
+        )
+
     @app.post("/v1/decide/text")
     async def decide_text(request: Request):
         data = _require_object(await read_json(request, TEXT_BODY_LIMIT))
@@ -276,40 +237,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if "state" in data and (size := _state_bytes(data["state"])) > MAX_STATE_BYTES:
             raise ApiError("payload_too_large", f"state is {size} bytes; limit is {MAX_STATE_BYTES}")
         req = _validate(TextDecisionRequest, data)
-
-        payload = {"state": data["state"], "questions": data["questions"]}
-        if req.model is not None:
-            payload["model"] = req.model
-        laya = await call_backend(
-            client(request), "text", f"{settings.text_backend_url}/predict", payload, settings.text_timeout_s
-        )
-
-        answers = laya.get("answers")
-        routing = laya.get("routing")
-        if not isinstance(answers, dict) or not all(isinstance(a, dict) for a in answers.values()):
-            raise ApiError("backend_error", "text backend returned an unexpected response")
-        routing = {k: v for k, v in routing.items() if k != "repo"} if isinstance(routing, dict) else {}
-
-        if req.min_confidence is not None:
-            for answer in answers.values():
-                conf = answer.get("confidence")
-                answer["low_confidence"] = not isinstance(conf, (int, float)) or conf < req.min_confidence
-
-        checkpoint = routing.get("model") or req.model
-        meta: dict[str, Any] = {"routing": routing}
-        if "usage" in laya:
-            meta["usage"] = laya["usage"]
-        if "model" in laya:
-            meta["backend_model"] = laya["model"]
-        return JSONResponse(
-            {
-                "model": f"laya-{checkpoint}" if checkpoint else "laya",
-                "model_version": settings.laya_model_version,
-                "latency_ms": _ms(request.state.start),
-                "results": answers,
-                "meta": meta,
-            }
-        )
+        return await run(request, TEXT_TASK, data, req)
 
     @app.post("/v1/classify/image")
     async def classify_image(request: Request):
@@ -329,66 +257,34 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             base64.b64decode(req.image.base64, validate=True)
         except (binascii.Error, ValueError):
             raise ApiError("invalid_request", "image.base64: not valid standard base64") from None
+        return await run(request, IMAGE_TASK, data, req)
 
-        resolved = {"model": settings.image_model_id, "model_version": settings.image_model_version}
-        backend = await call_backend(
-            client(request),
-            "image",
-            f"{settings.image_backend_url}/classify",
-            data,
-            settings.image_timeout_s,
-            **resolved,
-        )
-        results = backend.get("results")
-        if not isinstance(results, list) or not all(
-            isinstance(r, dict) and "label" in r and "score" in r for r in results
-        ):
-            raise ApiError("backend_error", "image backend returned an unexpected response", **resolved)
-
-        meta: dict[str, Any] = dict(backend["meta"]) if isinstance(backend.get("meta"), dict) else {}
-        if "device" in backend:
-            meta.setdefault("device", backend["device"])
-        meta["hypothesis_template"] = req.hypothesis_template or DEFAULT_TEMPLATE
-        meta["pad_to_square"] = DEFAULT_PAD_TO_SQUARE if req.pad_to_square is None else req.pad_to_square
-        if "latency_ms" in backend:
-            meta["backend_latency_ms"] = backend["latency_ms"]
-        if "model" in backend:
-            meta["backend_model"] = backend["model"]
-        return JSONResponse(
-            {
-                "model": settings.image_model_id,
-                "model_version": backend.get("model_version") or settings.image_model_version,
-                "latency_ms": _ms(request.state.start),
-                "results": results,
-                "meta": meta,
-            }
-        )
+    backend_urls = registry.backend_urls()
 
     @app.get("/v1/health")
     async def health(request: Request):
         http = client(request)
-        text, image = await asyncio.gather(
-            probe(http, settings.text_backend_url, settings.health_timeout_s),
-            probe(http, settings.image_backend_url, settings.health_timeout_s),
-        )
-        up = [b["status"] == "ok" for b in (text, image)]
+        probes = await asyncio.gather(*(probe(http, url, settings.health_timeout_s) for url in backend_urls))
+        by_url = dict(zip(backend_urls, probes, strict=True))
+        up = [p["status"] == "ok" for p in probes]
         status = "ok" if all(up) else "degraded" if any(up) else "down"
         return JSONResponse(
-            {"status": status, "backends": {"text": text, "image": image}},
+            {
+                "status": status,
+                "backends": {
+                    "text": by_url[registry.default(TEXT_TASK).backend_url],
+                    "image": by_url[registry.default(IMAGE_TASK).backend_url],
+                },
+                "models": {m.id: by_url[m.backend_url] for m in registry.models},
+            },
             status_code=503 if status == "down" else 200,
         )
 
-    models = [
-        {"id": f"laya-{c}", "task": "text-decision", "backend": "laya", "version": settings.laya_model_version}
-        for c in settings.laya_checkpoints
-    ] + [
-        {
-            "id": settings.image_model_id,
-            "task": "image-zero-shot",
-            "backend": "siglip2",
-            "version": settings.image_model_version,
-        }
-    ]
+    @app.get(LIVENESS_PATH)
+    async def healthz():
+        return {"status": "ok"}
+
+    models = [{"id": m.id, "task": m.task, "backend": m.backend, "version": m.version} for m in registry.models]
 
     @app.get("/v1/models")
     async def list_models():
@@ -401,9 +297,13 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    settings = Settings.from_env()
+    try:
+        settings = Settings.from_env()
+        app = create_app(settings)
+    except (RuntimeError, ValueError) as exc:  # bad keys/registry/env: one clear line, no traceback
+        raise SystemExit(f"decision-api: refusing to start: {exc}") from None
     uvicorn.run(
-        create_app(settings),
+        app,
         host=settings.host,
         port=settings.port,
         access_log=False,  # our own access log omits query strings and bodies

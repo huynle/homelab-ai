@@ -68,6 +68,7 @@ class ImageClassifyRequest(BaseModel):
     hypothesis_template: Annotated[str, StringConstraints(pattern=r"\{\}", max_length=512)] | None = None
     top_k: Annotated[int, Field(ge=1, le=64)] | None = None
     pad_to_square: bool | None = None
+    model: str | None = None
 
     @field_validator("candidate_labels")
     @classmethod
