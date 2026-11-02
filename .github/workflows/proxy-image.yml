@@ -1,0 +1,100 @@
+name: Proxy image
+
+# Builds services/proxy/Dockerfile. Pull requests build and smoke-test the image without pushing.
+# Pushes to main (and manual runs on main) publish ghcr.io/huynle/decision-api-proxy through the
+# org's reusable huynle/.github container-release.yml@v1, with immutable tags
+# git-<UTC yyyymmddHHMMSS>-<12-char sha> and sha-<full sha>; the digest is written to the job summary.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "services/proxy/**"
+      - ".github/workflows/proxy-image.yml"
+  pull_request:
+    paths:
+      - "services/proxy/**"
+      - ".github/workflows/proxy-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxy-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: proxy tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/proxy/requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
+
+  image:
+    name: container image smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: services/proxy
+          file: services/proxy/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: decision-api-proxy:ci
+      - name: smoke test /healthz
+        run: |
+          test "$(docker image inspect decision-api-proxy:ci --format '{{.Config.User}}')" = "10001:10001"
+          docker run -d --rm --name proxy -p 18080:8080 -e DECISION_API_KEYS=ci-smoke-key decision-api-proxy:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "${ok:-0}" = 1 ]; then
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/models)"
+            echo "unauthenticated /v1/models: $code"
+            [ "$code" = 401 ] || ok=0
+          fi
+          docker logs proxy
+          docker stop proxy
+          test "${ok:-0}" = 1
+
+  release:
+    name: Publish immutable container
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [test, image]
+    permissions:
+      contents: read
+      packages: write
+    uses: huynle/.github/.github/workflows/container-release.yml@v1
+    with:
+      image: ghcr.io/huynle/decision-api-proxy
+      context: services/proxy
+      dockerfile: services/proxy/Dockerfile
+      platforms: linux/amd64
+      runner: ubuntu-latest
+      provenance: true
+      sbom: true
+
+  print-release:
+    name: Print release
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "tag:    ${{ needs.release.outputs.git-tag }}"
+          echo "sha:    ${{ needs.release.outputs.sha-tag }}"
+          echo "digest: ${{ needs.release.outputs.digest }}"
