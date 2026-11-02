@@ -12,7 +12,9 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +23,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+import admin as admin_mod
 import metrics
+import oidc
 from adapters import ADAPTERS, Call, Result
 from config import Settings
+from db import utcnow
 from errors import ApiError, error_response
 from keystore import FileKeyStore, KeyStore, SqliteKeyStore, bearer_token, legacy_key_id
 from models import (
@@ -73,7 +78,7 @@ def read_pepper(path: str | None) -> bytes:
     return pepper
 
 
-def open_sqlite_store(settings: Settings):
+def open_sqlite_store(settings: Settings, now: Callable[[], datetime] = utcnow):
     """Open (and migrate) the key database, upsert the owners and import the file keys. KEYSTORE=sqlite only."""
     import db as dbmod
     import keyservice
@@ -87,14 +92,16 @@ def open_sqlite_store(settings: Settings):
         raise RuntimeError("KEYSTORE=sqlite needs DECISION_API_OWNER_EMAILS")
     database = dbmod.Database.open(settings.db_path, pepper=pepper)
     try:
-        keyservice.ensure_owners(database, settings.owner_emails)
-        imported = keyservice.import_legacy_keys(database, pepper, settings.api_keys, settings.owner_emails[0])
+        keyservice.ensure_owners(database, settings.owner_emails, now=now())
+        imported = keyservice.import_legacy_keys(
+            database, pepper, settings.api_keys, settings.owner_emails[0], now=now()
+        )
     except Exception:
         database.close()
         raise
     if imported:
         log.info("imported %d key(s) from the key file as owner keys", len(imported))
-    return SqliteKeyStore(database, pepper), database, UsageAggregator(database)
+    return SqliteKeyStore(database, pepper, now=now), database, UsageAggregator(database, now=now)
 
 
 # ---------------------------------------------------------------- request parsing
@@ -175,16 +182,38 @@ def create_app(
     settings: Settings | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     registry: Registry | None = None,
+    *,
+    oauth_transport: httpx.AsyncBaseTransport | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
+    """Build the app. ``oauth_transport`` (Google calls) and ``clock`` (an aware UTC ``now``) are for tests."""
     settings = Settings.from_env() if settings is None else settings
+    now = utcnow if clock is None else clock
     if registry is None:
         registry = load_registry(settings.registry_file) if settings.registry_file else registry_from_settings(settings)
     keystore: KeyStore
     database = usage = None
+    admin: admin_mod.Admin | None = None
     if settings.keystore == "sqlite":
-        keystore, database, usage = open_sqlite_store(settings)
+        keystore, database, usage = open_sqlite_store(settings, now)
+        try:
+            admin_config = admin_mod.load_config(settings, database.pepper)
+        except Exception:
+            database.close()
+            raise
+        if admin_config is not None:
+            google = oidc.GoogleOIDC(
+                admin_config.client_id,
+                admin_config.client_secret,
+                admin_config.redirect_uri,
+                transport=oauth_transport,
+                now=lambda: now().timestamp(),
+            )
+            admin = admin_mod.Admin(admin_config, database, google, now)
+            log.info("admin page enabled at %s/admin", admin_config.public_url)
         auth_required = True
     else:
+        admin_mod.load_config(settings, None)  # logs that the admin page is off in file mode
         if not settings.api_keys and not settings.allow_no_auth:
             raise RuntimeError(
                 "no API keys configured: set DECISION_API_KEYS_FILE or DECISION_API_KEYS "
@@ -270,8 +299,12 @@ def create_app(
         if request.url.path == LIVENESS_PATH:  # kubelet probes: no auth, no access-log noise, no metrics
             return await call_next(request)
         kid = principal = None
+        path = request.url.path
+        admin_path = admin_mod.is_admin_path(path)
         try:
-            if auth_required and request.url.path not in PUBLIC_PATHS:
+            if admin_path:  # own auth (session + CSRF); bearer keys never apply. Off: no admin route exists.
+                response = await call_next(request) if admin is not None else JSONResponse({"detail": "Not Found"}, 404)
+            elif auth_required and path not in PUBLIC_PATHS:
                 token = bearer_token(request.headers.get("authorization"))
                 principal = keystore.authenticate(token) if token else None
                 if principal is None:
@@ -282,24 +315,29 @@ def create_app(
             else:
                 response = await call_next(request)
         except Exception as exc:  # never leak internals to the client
-            log.error("unhandled %s on %s %s", type(exc).__name__, request.method, request.url.path)
-            response = error_response(ApiError("internal_error", "unexpected error"), _ms(start))
+            log.error("unhandled %s on %s %s", type(exc).__name__, request.method, admin_mod.log_path(path))
+            if admin_path and admin is not None:
+                response = admin_mod.error_json("internal_error", "unexpected error")
+            else:
+                response = error_response(ApiError("internal_error", "unexpected error"), _ms(start))
+        if admin_path and admin is not None:
+            admin_mod.secure(response)
         latency_ms = _ms(start)
         model = getattr(request.state, "model", None)
         access_log.info(
             json.dumps(
                 {
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": admin_mod.log_path(path) if admin is not None else path,
                     "status": response.status_code,
                     "latency_ms": latency_ms,
                     "key_id": kid,
                 }
             )
         )
-        mx.observe_request(request.url.path, model, response.status_code, kid, time.perf_counter() - start)
+        mx.observe_request(path, model, response.status_code, kid, time.perf_counter() - start)
         if usage is not None and principal is not None and principal.public_id is not None:
-            usage.record(principal.public_id, mx.route(request.url.path), model, response.status_code, latency_ms)
+            usage.record(principal.public_id, mx.route(path), model, response.status_code, latency_ms)
         return response
 
     def client(request: Request) -> httpx.AsyncClient:
@@ -388,14 +426,23 @@ def create_app(
     async def list_models():
         return {"models": models}
 
+    if admin is not None:
+        admin_mod.install(app, admin)
+
     # Route templates for the `route` label; /healthz is excluded from request metrics like from the access log.
-    routes = [r.path for r in app.routes if getattr(r, "path", None) and r.path != LIVENESS_PATH]
+    # With the admin page on, every /admin path is the single label value "admin" (see Metrics.route).
+    routes = [
+        r.path
+        for r in app.routes
+        if getattr(r, "path", None) and r.path != LIVENESS_PATH and not admin_mod.is_admin_path(r.path)
+    ]
     mx = app.state.metrics = metrics.Metrics(
-        routes=routes, version=APP_VERSION, model_ids=[m.id for m in registry.models]
+        routes=routes, version=APP_VERSION, model_ids=[m.id for m in registry.models], admin=admin is not None
     )
     app.state.keystore = keystore
     app.state.db = database
     app.state.usage = usage
+    app.state.admin = admin
     return app
 
 

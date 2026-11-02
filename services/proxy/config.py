@@ -46,6 +46,11 @@ class Settings:
     pepper_file: str | None = None
     owner_emails: tuple[str, ...] = ()
     usage_flush_s: float = 15.0
+    # Admin page (Google sign-in). Active only with KEYSTORE=sqlite and all four set; see admin.py.
+    oauth_client_id: str | None = None
+    oauth_client_secret_file: str | None = None
+    public_url: str | None = None
+    session_key_file: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -83,6 +88,10 @@ class Settings:
             pepper_file=get("DECISION_API_KEY_PEPPER_FILE", d.pepper_file),
             owner_emails=parse_emails(env.get("DECISION_API_OWNER_EMAILS") or ""),
             usage_flush_s=float(get("DECISION_API_USAGE_FLUSH_S", d.usage_flush_s)),
+            oauth_client_id=get("DECISION_API_OAUTH_CLIENT_ID", d.oauth_client_id),
+            oauth_client_secret_file=get("DECISION_API_OAUTH_CLIENT_SECRET_FILE", d.oauth_client_secret_file),
+            public_url=get("DECISION_API_PUBLIC_URL", d.public_url),
+            session_key_file=get("DECISION_API_SESSION_KEY_FILE", d.session_key_file),
         )
 
 
