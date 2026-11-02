@@ -34,6 +34,7 @@ class Settings:
     laya_checkpoints: tuple[str, ...] = DEFAULT_LAYA_CHECKPOINTS
     image_model_id: str = DEFAULT_IMAGE_MODEL_ID
     image_model_version: str = DEFAULT_IMAGE_MODEL_VERSION
+    registry_file: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -57,6 +58,7 @@ class Settings:
             laya_model_version=get("LAYA_MODEL_VERSION", d.laya_model_version),
             image_model_id=get("IMAGE_MODEL_ID", d.image_model_id),
             image_model_version=get("IMAGE_MODEL_VERSION", d.image_model_version),
+            registry_file=get("DECISION_API_REGISTRY_FILE", d.registry_file),
         )
 
 

@@ -1,0 +1,48 @@
+# Decision API backend registry. Point DECISION_API_REGISTRY_FILE at a copy of this file.
+#
+# Each entry is one model the proxy serves. `id` is what clients send as `model` and what /v1/models lists.
+#   task          text-decision (POST /v1/decide/text) or image-zero-shot (POST /v1/classify/image)
+#   adapter       how the backend is called: laya | zero-shot-image
+#   backend_url   base URL of the backend (no trailing path); /health is probed by GET /v1/health
+#   backend_model optional value forwarded to the backend (Laya `model`, i.e. the checkpoint)
+#   backend       optional label shown as `backend` in /v1/models (default: the adapter key)
+#   version       reported as `model_version` (package version or pinned model commit)
+#   timeout_s     optional request timeout in seconds (default 10)
+#
+# `defaults` picks the model for requests that do not send `model`. For Laya, an unpinned request keeps
+# Laya's automatic script/language routing; the response reports the checkpoint Laya actually used.
+# The file holds no secrets; API keys come from DECISION_API_KEYS_FILE.
+
+defaults:
+  text: laya-english
+  image: siglip2-base-patch16-224
+
+models:
+  - id: laya-english
+    task: text-decision
+    adapter: laya
+    backend_url: http://10.1.10.10:8000
+    backend_model: english
+    version: laya-serve-0.4.20
+    timeout_s: 10
+  - id: laya-multilingual
+    task: text-decision
+    adapter: laya
+    backend_url: http://10.1.10.10:8000
+    backend_model: multilingual
+    version: laya-serve-0.4.20
+    timeout_s: 10
+  - id: laya-typed-decisions
+    task: text-decision
+    adapter: laya
+    backend_url: http://10.1.10.10:8000
+    backend_model: typed-decisions
+    version: laya-serve-0.4.20
+    timeout_s: 10
+  - id: siglip2-base-patch16-224
+    task: image-zero-shot
+    adapter: zero-shot-image
+    backend: siglip2
+    backend_url: http://10.1.10.10:8010
+    version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+    timeout_s: 10

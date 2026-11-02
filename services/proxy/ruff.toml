@@ -5,4 +5,4 @@ target-version = "py311"
 extend-select = ["I", "B", "UP"]
 
 [lint.isort]
-known-first-party = ["app", "config", "errors", "models", "conftest"]
+known-first-party = ["adapters", "app", "config", "errors", "models", "registry", "conftest"]
