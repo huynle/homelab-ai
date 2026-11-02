@@ -285,8 +285,8 @@ for an `AttributeError` or `ImportError`.
 ## Known caveats
 
 - **`pad_to_square` is off by default.** Padding keeps the aspect ratio, but it makes scores for
-  tall images such as receipts less decisive. On the left Shell crop fuel receipt, `receipt` scored
-  0.993 unpadded and 0.432 padded; the dog image was unaffected. Send `"pad_to_square": true` only
+  tall images such as receipts less decisive. On the left Shell receipt crop, the `fuel receipt`
+  label scored 0.993 unpadded and 0.432 padded; the dog image was unaffected. Send `"pad_to_square": true` only
   for images where squashing distorts the subject.
 - **Laya confidence is uncalibrated.** The English Laya checkpoint's `confidence` values are not
   calibrated probabilities. Treat `min_confidence` thresholds as tuning knobs and check them against
