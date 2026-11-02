@@ -17,6 +17,7 @@ DEFAULT_IMAGE_MODEL_VERSION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
 DEFAULT_LAYA_CHECKPOINTS = ("english", "multilingual", "typed-decisions")
 
 TRUTHY = {"1", "true", "yes", "on"}
+KEYSTORES = ("file", "sqlite")
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,12 @@ class Settings:
     metrics_host: str | None = None  # None: same as host
     metrics_port: int = 9090
     backend_probe_interval_s: float = 30.0  # 0 disables the periodic backend probe
+    # Key store. "file" (default): the keys above, nothing written. "sqlite": opt-in, needs the three below.
+    keystore: str = "file"
+    db_path: str | None = None
+    pepper_file: str | None = None
+    owner_emails: tuple[str, ...] = ()
+    usage_flush_s: float = 15.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -48,6 +55,10 @@ class Settings:
         def get(name: str, default):
             value = env.get(name)
             return default if value is None or value.strip() == "" else value.strip()
+
+        keystore = get("KEYSTORE", d.keystore).lower()
+        if keystore not in KEYSTORES:
+            raise ValueError(f"KEYSTORE must be one of {', '.join(KEYSTORES)} (got {keystore!r})")
 
         return cls(
             api_keys=load_api_keys(env),
@@ -67,7 +78,22 @@ class Settings:
             metrics_host=get("METRICS_HOST", d.metrics_host),
             metrics_port=int(get("METRICS_PORT", d.metrics_port)),
             backend_probe_interval_s=float(get("BACKEND_PROBE_INTERVAL_S", d.backend_probe_interval_s)),
+            keystore=keystore,
+            db_path=get("DECISION_API_DB_PATH", d.db_path),
+            pepper_file=get("DECISION_API_KEY_PEPPER_FILE", d.pepper_file),
+            owner_emails=parse_emails(env.get("DECISION_API_OWNER_EMAILS") or ""),
+            usage_flush_s=float(get("DECISION_API_USAGE_FLUSH_S", d.usage_flush_s)),
         )
+
+
+def parse_emails(value: str) -> tuple[str, ...]:
+    """Comma-separated emails, trimmed and lowercased, without duplicates."""
+    emails: list[str] = []
+    for e in value.split(","):
+        e = e.strip().lower()
+        if e and e not in emails:
+            emails.append(e)
+    return tuple(emails)
 
 
 def _parse_key_file(path: Path) -> list[str]:
