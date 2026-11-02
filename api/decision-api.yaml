@@ -38,6 +38,8 @@ info:
 
     All routes require a bearer API key except `GET /v1/health` and `GET /healthz`.
 servers:
+  - url: https://decide.ai.huynle.com
+    description: Production (k3s, Traefik, API keys).
   - url: http://127.0.0.1:{port}
     variables:
       port:
