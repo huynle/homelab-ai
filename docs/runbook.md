@@ -45,14 +45,21 @@ ssh -i ~/.ssh/id_vms huy@10.1.10.10
 
 ## Deploy proxy changes
 
-1. Merge a PR to `main` that touches `services/proxy/**`.
-2. [`.github/workflows/proxy-image.yml`](../.github/workflows/proxy-image.yml) tests the proxy and pushes
-   `ghcr.io/huynle/decision-api-proxy:git-<UTC timestamp>-<12-char sha>`.
-3. Flux image automation in infra picks the newest tag (checked every 5 minutes), commits the new tag
-   and digest into `apps/homelab/decision-api/release.yaml`, and the HelmRelease rolls the pod.
-4. Check: `curl -s https://decide.ai.huynle.com/v1/health` and the [smoke tests](#health-checks-and-smoke-tests).
+Promotion is **manual** since the SQLite key store (ADR 0033 in `huynle/infra`): the image repository in
+`apps/homelab/decision-api/image-source.yaml` is suspended and there is no image policy.
 
-No manual step is needed. To see where it is: `flux get image policy -n flux-system` and
+1. Merge a PR to `main` that touches `services/proxy/**`.
+2. [`.github/workflows/proxy-image.yml`](../.github/workflows/proxy-image.yml) tests the proxy, smoke-tests the
+   container and pushes `ghcr.io/huynle/decision-api-proxy:git-<UTC timestamp>-<12-char sha>`. Copy the tag and
+   `sha256:` digest from the run.
+3. In an infra worktree: `scripts/promote-manual-image.py decision-api <tag> <digest>`, `scripts/validate-infra.sh`,
+   open and merge the PR. Check for new `services/proxy/migrations/` files and a recent backup first; the full
+   procedure is `docs/runbooks/manual-image-promotion.md#promote-decision-api` in infra.
+4. Check: `kubectl -n decision-api rollout status deploy/decision-api`, `curl -s
+   https://decide.ai.huynle.com/v1/health` and the [smoke tests](#health-checks-and-smoke-tests). The release uses
+   `Recreate`, so each promotion is a brief outage.
+
+To see what runs:
 `kubectl -n decision-api get deploy decision-api -o jsonpath='{.spec.template.spec.containers[0].image}'`.
 
 ## Deploy backend changes
@@ -139,6 +146,10 @@ curl -s -H "Authorization: Bearer $DECISION_API_KEY" $API/v1/models
 curl -s -H "Authorization: Bearer $DECISION_API_KEY" -H 'content-type: application/json' \
   -d @api/fixtures/laya-predict.request.json $API/v1/decide/text
 curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/v1/decide/text   # expect 401
+# OpenAI Decisions format; answers[0].type is "predicate"
+curl -s -H "Authorization: Bearer $DECISION_API_KEY" -H 'content-type: application/json' \
+  -d '{"model":"gpt-6-luna","input":"Please refund it or I cancel.","questions":[{"type":"predicate","name":"churn","instructions":"Does the user threaten to cancel?"}]}' \
+  $API/v1/decisions
 ```
 
 The image example is in the [README](../README.md#image-classification).

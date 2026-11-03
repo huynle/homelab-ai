@@ -131,3 +131,71 @@ def test_healthz_matches_schema(client, spec, validate):
     resp = client.get("/healthz")
     assert resp.status_code == 200
     validate(resp.json(), "Liveness")
+
+
+# ---------------------------------------------------------------- /v1/decisions (OpenAI wire format)
+
+PNG_URL = "data:image/png;base64," + "iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def _decision_examples(spec):
+    op = spec["paths"]["/v1/decisions"]["post"]
+    req = op["requestBody"]["content"]["application/json"]["examples"]["support_ticket"]["value"]
+    resp = op["responses"]["200"]["content"]["application/json"]["examples"]["support_ticket"]["value"]
+    return req, resp
+
+
+def test_decision_spec_example_round_trips_through_the_proxy(client, auth, spec, validate):
+    """The spec's request example, answered by the real Laya capture, gives exactly the spec's response example."""
+    req, resp_example = _decision_examples(spec)
+    validate(req, "DecisionCreateRequest")
+    validate(resp_example, "Decision")
+    resp = client.post("/v1/decisions", json=req, headers=auth)
+    assert resp.status_code == 200, resp.text
+    validate(resp.json(), "Decision")
+    assert resp.json() == resp_example
+
+
+def test_decision_image_and_refusal_answers_match_schema(client, auth, backends, validate):
+    image_req = {
+        "model": "gpt-6-luna",
+        "input": [{"role": "user", "content": [{"type": "input_image", "image_url": PNG_URL}]}],
+        "questions": [
+            {"type": "choice", "instructions": "?", "choices": [{"value": "german shepherd"}, {"value": "dog"}]}
+        ],
+    }
+    validate(image_req, "DecisionCreateRequest")
+    resp = client.post("/v1/decisions", json=image_req, headers=auth)
+    assert resp.status_code == 200, resp.text
+    validate(resp.json(), "Decision")
+
+    backends.text = lambda req: httpx.Response(200, json={"answers": {}, "usage": {"input_tokens": 3}})
+    text_req = {"input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}
+    validate(text_req, "DecisionCreateRequest")
+    resp = client.post("/v1/decisions", json=text_req, headers=auth)
+    assert resp.json()["answers"] == [{"type": "refusal", "name": None}]
+    validate(resp.json(), "Decision")
+
+
+def test_decision_errors_match_schema(client, auth, validate):
+    for resp in (
+        client.post("/v1/decisions", json={"input": "x", "questions": []}, headers=auth),
+        client.post("/v1/decisions", json={"input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
+    ):
+        assert resp.status_code >= 400
+        validate(resp.json(), "ErrorEnvelope")
+
+
+def test_schema_rejects_what_the_proxy_rejects(validate):
+    with pytest.raises(AssertionError):
+        validate({"input": "x", "questions": [{"type": "box", "instructions": "?"}]}, "DecisionCreateRequest")
+    with pytest.raises(AssertionError):
+        validate(
+            {"input": "x", "questions": [{"type": "predicate", "instructions": "?"}], "stream": True},
+            "DecisionCreateRequest",
+        )
+    with pytest.raises(AssertionError):
+        bad_image = [{"role": "user", "content": [{"type": "input_image", "image_url": "https://x/y.png"}]}]
+        validate(
+            {"input": bad_image, "questions": [{"type": "predicate", "instructions": "?"}]}, "DecisionCreateRequest"
+        )

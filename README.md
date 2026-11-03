@@ -8,6 +8,7 @@ text decisions (Laya) and zero-shot image classification (SigLIP2), served at
 |---|---|---|
 | `POST /v1/decide/text` | Laya text server | `choice`, `score`, and `noul` (yes/no/unknown) answers about a text `state` |
 | `POST /v1/classify/image` | SigLIP2 `siglip2-base-patch16-224` | pick among `candidate_labels` for an image |
+| `POST /v1/decisions` | Laya, or SigLIP2 for one image | [OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions) wire format (`predicate`, `choice`, `score`) |
 | `GET /v1/health` | both | readiness (no auth) |
 | `GET /v1/models` | both | served models |
 | `GET /healthz` | none | proxy liveness (no auth) |
@@ -106,6 +107,30 @@ The response's `results` is `[{label, score}]`, highest score first. `pad_to_squ
 padding makes scores for tall document images such as receipts less decisive, so send
 `"pad_to_square": true` only for images where squashing distorts the subject. Images
 are limited to 8 MiB after decoding.
+
+### OpenAI Decisions API
+
+`POST /v1/decisions` accepts OpenAI's Decisions request body and returns its `Decision` object, so the
+OpenAI SDK works by pointing `base_url` at the proxy. `gpt-6-luna` selects the default model:
+
+```python
+import os
+
+from openai import OpenAI
+
+client = OpenAI(base_url="https://decide.ai.huynle.com/v1", api_key=os.environ["DECISION_API_KEY"])
+decision = client.decisions.create(
+    model="gpt-6-luna",
+    input="I was charged twice for my order.",
+    questions=[{"type": "choice", "name": "department", "instructions": "Which department?",
+                "choices": [{"value": "billing"}, {"value": "technical"}, {"value": "other"}]}],
+)
+print(decision.answers[0].choice)
+```
+
+Text, JSON and conversations are answered by Laya. A request with one base64 image and only `choice`
+questions is answered by SigLIP2; other image requests and hosted image URLs return 400. See the
+[contract](api/decision-api.yaml) (`createDecision`) for the mapping and limits.
 
 Typical latency through the public route from the LAN: text decisions about 0.16–0.26 s, image
 classification of a photo about 0.35 s. See the [runbook's known caveats](docs/runbook.md#known-caveats).
