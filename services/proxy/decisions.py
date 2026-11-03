@@ -75,6 +75,7 @@ class Plan:
     questions: list[Question]
     state: str | dict | None = None  # Laya state (text path)
     image: Image | None = None  # SigLIP2 image (image path)
+    image_ignored: bool = False  # an image came with text or JSON evidence: Laya answers from the text only
 
 
 # ---------------------------------------------------------------- parsing
@@ -141,17 +142,21 @@ def _parts(content: Any, allowed: frozenset[str], param: str, images: list[tuple
     return pieces
 
 
-def parse_input(value: Any) -> tuple[str | dict, list[tuple[Image, str]]]:
-    """``input`` -> (Laya state, images). One user message stays plain text or a JSON object; more is a transcript."""
+def parse_input(value: Any) -> tuple[str | dict, list[tuple[Image, str]], bool]:
+    """``input`` -> (Laya state, images, has text or JSON evidence besides the images).
+
+    One user message stays plain text or a JSON object (its images left out); more is a transcript.
+    """
     images: list[tuple[Image, str]] = []
     if isinstance(value, str):
-        return value, images
+        return value, images, bool(value.strip())
     if not isinstance(value, list):
         raise bad("input", "must be a string or an array of input items")
     if not value:
         raise bad("input", "must not be empty")
 
     lines: list[str] = []
+    evidence = False
     calls: dict[str, set[str]] = {kind: set() for kind in CALLS}
     for i, item in enumerate(value):
         p = f"input[{i}]"
@@ -165,12 +170,14 @@ def parse_input(value: Any) -> tuple[str | dict, list[tuple[Image, str]]]:
             if not isinstance(role, str) or role not in MESSAGE_PARTS:
                 raise bad(f"{p}.role", f"{role!r} is not supported (allowed: assistant, developer, system, user)")
             text = "\n".join(_parts(item.get("content"), MESSAGE_PARTS[role], f"{p}.content", images))
+            evidence = evidence or bool(text.strip())
             lines.append(f"{'developer' if role == 'system' else role}: {text}")
         elif kind in CALLS:
             call_id = _str(item.get("call_id"), f"{p}.call_id", allow_empty=False)
             name = _str(item.get("name"), f"{p}.name", allow_empty=False)
             body = _str(item.get("arguments" if kind == "function_call" else "input"), p)
             calls[kind].add(call_id)
+            evidence = True  # a tool call is evidence of its own (name and arguments)
             lines.append(f"{kind} {call_id} {name}: {body}")
         elif kind in CALLS.values():
             call_id = _str(item.get("call_id"), f"{p}.call_id", allow_empty=False)
@@ -178,6 +185,7 @@ def parse_input(value: Any) -> tuple[str | dict, list[tuple[Image, str]]]:
             if call_id not in calls[call_kind]:
                 raise bad(f"{p}.call_id", f"no earlier {call_kind} has call_id {call_id!r}")
             text = "\n".join(_parts(item.get("output"), OUTPUT_PARTS, f"{p}.output", images))
+            evidence = evidence or bool(text.strip())
             lines.append(f"{kind} {call_id}: {text}")
         else:
             raise bad(f"{p}.type", f"input item type {kind!r} is not supported")
@@ -186,13 +194,14 @@ def parse_input(value: Any) -> tuple[str | dict, list[tuple[Image, str]]]:
     if only is not None and only.get("type", "message") == "message" and only.get("role") == "user":
         content = only.get("content")
         if isinstance(content, str):
-            return content, images
-        kinds = [part["type"] for part in content]
-        if kinds == ["input_json"] and isinstance(content[0]["data"], dict):
-            return content[0]["data"], images
+            return content, images, evidence
+        parts = [part for part in content if part["type"] != "input_image"]
+        kinds = [part["type"] for part in parts]
+        if kinds == ["input_json"] and isinstance(parts[0]["data"], dict):
+            return parts[0]["data"], images, evidence
         if kinds and all(k == "input_text" for k in kinds):
-            return "\n".join(part["text"] for part in content), images
-    return "\n".join(lines), images
+            return "\n".join(part["text"] for part in parts), images, evidence
+    return "\n".join(lines), images, evidence
 
 
 def _instructions(value: Any, param: str) -> str:
@@ -287,19 +296,22 @@ def parse(data: dict) -> Plan:
         raise bad("questions", f"must be an array of 1 to {MAX_DECISION_QUESTIONS} questions")
     if "input" not in data:
         raise bad("input", "is required")
-    state, images = parse_input(data["input"])
+    state, images, evidence = parse_input(data["input"])
     plan = Plan(model, [_question(q, i) for i, q in enumerate(questions)])
     _assign_qids(plan.questions)
 
-    if images:
-        if len(images) > 1:
-            raise bad("input", "at most one image is supported per request (it is classified with SigLIP2)")
+    if len(images) > 1:
+        raise bad("input", "at most one image is supported per request")
+    if images and evidence:
+        # Text wins: SigLIP2 cannot read text or JSON, so Laya answers from them and the image is ignored.
+        plan.image_ignored = True
+    elif images:
         for i, q in enumerate(plan.questions):
             if q.type != "choice":
                 raise bad(
                     f"questions[{i}]",
-                    "with an image input only choice questions are supported "
-                    "(SigLIP2 zero-shot classification over the choice values)",
+                    "an image with no text or JSON is classified by SigLIP2, which answers only choice questions "
+                    "(over the choice values); send text or JSON evidence to have Laya answer instead",
                 )
             for j, (_, label, _) in enumerate(q.choices):
                 if not 1 <= len(label) <= MAX_LABEL_CHARS:

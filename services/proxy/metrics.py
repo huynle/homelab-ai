@@ -74,6 +74,12 @@ class Metrics:
             ("model", "error_code"),
             registry=reg,
         )
+        self.decision_images_ignored = Counter(
+            f"{PREFIX}_decision_images_ignored_total",
+            "POST /v1/decisions requests whose image was ignored because text or JSON evidence came with it",
+            ("model",),
+            registry=reg,
+        )
         self.backend_up = Gauge(
             f"{PREFIX}_backend_up",
             "1 when the model's backend answered its last health probe, else 0",
@@ -103,6 +109,9 @@ class Metrics:
         self.backend_duration.labels(model=model).observe(seconds)
         if error_code is not None:
             self.backend_errors.labels(model=model, error_code=error_code).inc()
+
+    def observe_image_ignored(self, model: str) -> None:
+        self.decision_images_ignored.labels(model=model).inc()
 
     def set_backend_up(self, model: str, up: bool) -> None:
         self.backend_up.labels(model=model).set(1 if up else 0)

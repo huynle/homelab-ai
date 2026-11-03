@@ -434,8 +434,10 @@ def test_oversized_text_state_is_413(client, auth, echo):
 # ---------------------------------------------------------------- images (SigLIP2)
 
 
-def image_input(*urls, text="Inspect the product in this photo."):
-    parts = [{"type": "input_text", "text": text}] + [{"type": "input_image", "image_url": u} for u in urls]
+def image_input(*urls, text=None):
+    """One user message holding the images; with ``text`` the text comes first (then the image is ignored)."""
+    parts = [{"type": "input_text", "text": text}] if text is not None else []
+    parts += [{"type": "input_image", "image_url": u} for u in urls]
     return [{"role": "user", "content": parts}]
 
 
@@ -499,17 +501,22 @@ def test_jpg_data_url_is_sent_as_jpeg(client, auth, backends):
         ({"input": image_input(PNG_URL), "questions": [CHURN]}, "questions[0]"),
         ({"input": image_input(PNG_URL), "questions": [CATEGORY, URGENCY]}, "questions[1]"),
         ({"input": image_input(PNG_URL, PNG_URL), "questions": [CATEGORY]}, "input"),
+        ({"input": image_input(PNG_URL, PNG_URL, text="two shots"), "questions": [CATEGORY]}, "input"),
+        (
+            {"input": image_input("https://example.com/cat.jpg", text="x"), "questions": [CATEGORY]},
+            "input[0].content[1].image_url",
+        ),
+        (
+            {"input": image_input("data:image/gif;base64,R0lGODlh", text="x"), "questions": [CATEGORY]},
+            "input[0].content[1].image_url",
+        ),
+        (
+            {"input": image_input("data:image/png;base64,not base64!", text="x"), "questions": [CATEGORY]},
+            "input[0].content[1].image_url",
+        ),
         (
             {"input": image_input("https://example.com/cat.jpg"), "questions": [CATEGORY]},
-            "input[0].content[1].image_url",
-        ),
-        (
-            {"input": image_input("data:image/gif;base64,R0lGODlh"), "questions": [CATEGORY]},
-            "input[0].content[1].image_url",
-        ),
-        (
-            {"input": image_input("data:image/png;base64,not base64!"), "questions": [CATEGORY]},
-            "input[0].content[1].image_url",
+            "input[0].content[0].image_url",
         ),
         (
             {"input": "x", "questions": [dict(CATEGORY, instructions=[{"type": "input_image", "image_url": PNG_URL}])]},
@@ -532,14 +539,121 @@ def test_too_many_image_labels_are_rejected(client, auth, backends):
     )
 
 
-def test_image_tool_output_counts_as_the_image(client, auth, backends):
+def test_tool_call_with_image_output_goes_to_laya(client, auth, backends):
     items = [
-        {"type": "function_call", "call_id": "c1", "name": "snap", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_image", "image_url": PNG_URL}]},
+        {"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_image", "image_url": PNG_URL}]}
     ]
+    items.insert(0, {"type": "function_call", "call_id": "c1", "name": "snap", "arguments": ""})
     resp = post(client, auth, {"model": "gpt-6-luna", "input": items, "questions": [CATEGORY]})
     assert resp.status_code == 200, resp.text
-    assert classify_calls(backends)[0]["image"]["base64"] == PNG_B64
+    # the call itself carries a name, which is evidence: text wins
+    assert classify_calls(backends) == []
+    assert resp.headers["x-decision-image"] == "ignored"
+
+
+# ---------------------------------------------------------------- text wins: image + text/JSON goes to Laya
+
+SCREENSHOT_STATE = {"url": "https://shop.example/cart", "elements": ["[3] button Checkout", "[4] link Help"]}
+OPERATION = {
+    "type": "choice",
+    "name": "operation",
+    "instructions": "Next browser action?",
+    "choices": [{"value": "CLICK"}, {"value": "TYPE"}, {"value": "DONE"}],
+}
+TARGET = {
+    "type": "choice",
+    "name": "target",
+    "instructions": "Which element?",
+    "choices": [{"value": "3"}, {"value": "4"}],
+}
+
+
+def tabcrew_input(*extra_parts):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_json", "data": SCREENSHOT_STATE},
+                {"type": "input_image", "image_url": PNG_URL},
+                *extra_parts,
+            ],
+        }
+    ]
+
+
+def test_screenshot_with_page_state_goes_to_laya_and_is_flagged(client, auth, echo):
+    resp = post(client, auth, {"model": "gpt-6-luna", "input": tabcrew_input(), "questions": [OPERATION, TARGET]})
+    assert resp.status_code == 200, resp.text
+    assert classify_calls(echo) == []
+    (sent,) = predict_calls(echo)
+    assert sent["state"] == SCREENSHOT_STATE  # the image is dropped; the JSON stays a JSON state
+    assert set(sent["questions"]) == {"operation", "target"}
+    assert resp.headers["x-decision-image"] == "ignored"
+    body = resp.json()
+    assert body["model"] == "laya-english"
+    assert [a["choice"] for a in body["answers"]] == ["CLICK", "3"]
+
+
+def test_image_with_text_answers_any_question_type(client, auth, echo):
+    resp = post(
+        client,
+        auth,
+        {"model": "gpt-6-luna", "input": image_input(PNG_URL, text=TICKET), "questions": [CHURN, URGENCY, DEPARTMENT]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert predict_calls(echo)[0]["state"] == TICKET
+    assert [a["type"] for a in resp.json()["answers"]] == ["predicate", "score", "choice"]
+    assert resp.headers["x-decision-image"] == "ignored"
+
+
+def test_text_in_another_message_also_wins(client, auth, echo):
+    items = [{"role": "developer", "content": "Route the ticket."}, *image_input(PNG_URL)]
+    resp = post(client, auth, {"model": "gpt-6-luna", "input": items, "questions": [DEPARTMENT]})
+    assert resp.status_code == 200, resp.text
+    assert classify_calls(echo) == [] and len(predict_calls(echo)) == 1
+    assert "image" not in predict_calls(echo)[0]["state"]
+
+
+def test_blank_text_does_not_count_as_evidence(client, auth, backends):
+    resp = post(
+        client, auth, {"model": "gpt-6-luna", "input": image_input(PNG_URL, text="  \n"), "questions": [CATEGORY]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(classify_calls(backends)) == 1
+    assert "x-decision-image" not in resp.headers
+
+
+def test_image_only_is_not_flagged(client, auth, backends):
+    resp = post(client, auth, {"model": "gpt-6-luna", "input": image_input(PNG_URL), "questions": [CATEGORY]})
+    assert resp.status_code == 200 and "x-decision-image" not in resp.headers
+
+
+def test_text_requests_are_not_flagged(client, auth, echo):
+    resp = post(client, auth, {"model": "gpt-6-luna", "input": "x", "questions": [CHURN]})
+    assert resp.status_code == 200 and "x-decision-image" not in resp.headers
+
+
+def test_ignored_images_are_counted(client, auth, echo):
+    def ignored():
+        return (
+            client.app.state.metrics.registry.get_sample_value(
+                "decision_api_decision_images_ignored_total", {"model": "laya-english"}
+            )
+            or 0.0
+        )
+
+    post(client, auth, {"model": "gpt-6-luna", "input": tabcrew_input(), "questions": [OPERATION]})
+    post(client, auth, {"model": "gpt-6-luna", "input": "x", "questions": [CHURN]})
+    assert ignored() == 1.0
+
+
+def test_pinned_image_model_with_text_is_rejected(client, auth, echo):
+    err = assert_error(
+        post(client, auth, {"model": "siglip2-base-patch16-224", "input": tabcrew_input(), "questions": [OPERATION]}),
+        400,
+        "invalid_request",
+    )
+    assert err["param"] == "model"
 
 
 def test_oversized_image_is_413(client, auth, backends):
@@ -659,3 +773,43 @@ def test_malformed_siglip_results_are_502(client, auth, backends, result):
         "backend_error",
         "server_error",
     )
+
+
+# ---------------------------------------------------------------- backend hardening on the native routes
+
+
+def _nan_json(payload):
+    return httpx.Response(
+        200, content=json.dumps(payload, allow_nan=True).encode(), headers={"content-type": "application/json"}
+    )
+
+
+def test_native_text_route_rejects_non_finite_backend_numbers(client, auth, backends, laya_request, laya_predict):
+    bad = json.loads(json.dumps(laya_predict))
+    bad["answers"]["department"]["confidence"] = float("nan")
+    backends.text = lambda req: _nan_json(bad)
+    assert_error(client.post("/v1/decide/text", json=laya_request, headers=auth), 502, "backend_error", "server_error")
+
+
+def test_native_image_route_rejects_non_finite_backend_numbers(client, auth, backends, image_request):
+    backends.image = lambda req: _nan_json({"results": [{"label": "dog", "score": float("inf")}]})
+    assert_error(
+        client.post("/v1/classify/image", json=image_request, headers=auth), 502, "backend_error", "server_error"
+    )
+
+
+@pytest.mark.parametrize(
+    "detail", ["bad file /home/huy/laya-test/models/laya/x.bin", "C:\\Users\\huy\\x", "/Users/huy/a b/c"]
+)
+def test_backend_4xx_detail_has_paths_redacted(client, auth, backends, laya_request, detail):
+    backends.text = lambda req: httpx.Response(422, json={"detail": detail})
+    err = assert_error(client.post("/v1/decide/text", json=laya_request, headers=auth), 400, "invalid_request")
+    assert "huy" not in err["message"] and "[path]" in err["message"]
+
+
+def test_backend_4xx_validation_text_is_kept(client, auth, backends, laya_request):
+    backends.text = lambda req: httpx.Response(
+        422, json={"detail": [{"loc": ["body", "questions"], "msg": "too many"}]}
+    )
+    err = assert_error(client.post("/v1/decide/text", json=laya_request, headers=auth), 400, "invalid_request")
+    assert "body.questions: too many" in err["message"]
