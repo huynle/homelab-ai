@@ -11,6 +11,7 @@ import binascii
 import contextlib
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -108,6 +109,17 @@ def open_sqlite_store(settings: Settings, now: Callable[[], datetime] = utcnow):
 # ---------------------------------------------------------------- request parsing
 
 
+def _reject_constant(name: str):
+    raise ValueError(f"{name} is not valid JSON")  # json.loads accepts NaN/Infinity by default
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):  # 1e999 parses as inf
+        raise ValueError(f"{text} is out of range")
+    return value
+
+
 async def read_json(request: Request, limit: int) -> Any:
     """Read the body with a hard byte cap (before any parsing), then decode JSON."""
     too_large = ApiError("payload_too_large", f"request body exceeds {limit} bytes")
@@ -120,7 +132,7 @@ async def read_json(request: Request, limit: int) -> Any:
         if len(buf) > limit:
             raise too_large
     try:
-        return json.loads(buf)
+        return json.loads(buf, parse_constant=_reject_constant, parse_float=_finite_float)
     except (ValueError, UnicodeDecodeError):
         raise ApiError("invalid_request", "request body is not valid JSON") from None
 

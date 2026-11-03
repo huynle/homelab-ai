@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -101,6 +102,8 @@ def _image(url: Any, param: str) -> Image:
     if m is None:
         raise bad(param, "must be a base64 data URL of a PNG or JPEG image (data:image/png;base64,...)")
     media_type, b64 = m.group(1), m.group(2)
+    if not b64:
+        raise bad(param, "the data URL holds no image data")
     decoded = len(b64) * 3 // 4 - (2 if b64.endswith("==") else 1 if b64.endswith("=") else 0)
     if len(b64) > MAX_IMAGE_B64_CHARS or decoded > MAX_IMAGE_BYTES:
         raise ApiError(
@@ -117,15 +120,15 @@ def _parts(content: Any, allowed: frozenset[str], param: str, images: list[tuple
     """Render a content string or part list as text pieces; collect images."""
     if isinstance(content, str):
         return [content]
-    if not isinstance(content, list):
-        raise bad(param, "must be a string or an array of content parts")
+    if not isinstance(content, list) or not content:
+        raise bad(param, "must be a string or a non-empty array of content parts")
     pieces = []
     for j, part in enumerate(content):
         p = f"{param}[{j}]"
         if not isinstance(part, dict):
             raise bad(p, "must be an object")
         kind = part.get("type")
-        if kind not in allowed:
+        if not isinstance(kind, str) or kind not in allowed:
             raise bad(f"{p}.type", f"{kind!r} is not supported here (allowed: {', '.join(sorted(allowed))})")
         if kind in ("input_text", "output_text"):
             pieces.append(_str(part.get("text"), f"{p}.text"))
@@ -155,9 +158,11 @@ def parse_input(value: Any) -> tuple[str | dict, list[tuple[Image, str]]]:
         if not isinstance(item, dict):
             raise bad(p, "must be an object")
         kind = item.get("type", "message")
+        if not isinstance(kind, str):
+            raise bad(f"{p}.type", "must be a string")
         if kind == "message":
             role = item.get("role")
-            if role not in MESSAGE_PARTS:
+            if not isinstance(role, str) or role not in MESSAGE_PARTS:
                 raise bad(f"{p}.role", f"{role!r} is not supported (allowed: assistant, developer, system, user)")
             text = "\n".join(_parts(item.get("content"), MESSAGE_PARTS[role], f"{p}.content", images))
             lines.append(f"{'developer' if role == 'system' else role}: {text}")
@@ -209,7 +214,7 @@ def _question(q: Any, i: int) -> Question:
     if not isinstance(q, dict):
         raise bad(p, "must be an object")
     kind = q.get("type")
-    if kind not in QUESTION_FIELDS:
+    if not isinstance(kind, str) or kind not in QUESTION_FIELDS:
         raise bad(f"{p}.type", f"{kind!r} is not a question type (predicate, choice, score)")
     extra = sorted(set(q) - QUESTION_FIELDS[kind])
     if extra:
@@ -349,7 +354,7 @@ def siglip_payloads(plan: Plan) -> list[dict]:
 
 
 def _number(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ApiError("backend_error", "backend returned an unexpected answer")
     return value
 
@@ -365,7 +370,7 @@ def _from_laya(q: Question, ans: Any) -> dict:
     confidence = _number(ans.get("confidence"))
     if q.type == "choice":
         by_label = {label: value for value, label, _ in q.choices}
-        if ans.get("choice") not in by_label:
+        if not isinstance(ans.get("choice"), str) or ans["choice"] not in by_label:
             raise ApiError("backend_error", "backend returned a choice that was not offered")
         return {
             "type": "choice",
@@ -391,7 +396,9 @@ def _from_laya(q: Question, ans: Any) -> dict:
 def _from_siglip(q: Question, results: Any) -> dict:
     if not isinstance(results, list) or not results:
         raise ApiError("backend_error", "image backend returned no labels")
-    scores = {r["label"]: _number(r["score"]) for r in results}
+    if not all(isinstance(r, dict) and isinstance(r.get("label"), str) for r in results):
+        raise ApiError("backend_error", "image backend returned an unexpected response")
+    scores = {r["label"]: _number(r.get("score")) for r in results}
     by_label = {label: value for value, label, _ in q.choices}
     top = max(scores, key=scores.__getitem__)
     if top not in by_label:

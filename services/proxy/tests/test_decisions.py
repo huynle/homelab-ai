@@ -587,3 +587,75 @@ def test_backend_urls(client, auth, echo):
     post(client, auth, {"model": "gpt-6-luna", "input": image_input(PNG_URL), "questions": [CATEGORY]})
     urls = {str(r.url) for r in echo.requests}
     assert urls == {f"{TEXT_URL}/predict", f"{IMAGE_URL}/classify"}
+
+
+# ---------------------------------------------------------------- hardening (found by adversarial verification)
+
+P = {"type": "predicate", "instructions": "x"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"input": [{"role": ["user"], "content": "x"}], "questions": [P]},
+        {"input": [{"type": ["message"], "role": "user", "content": "x"}], "questions": [P]},
+        {"input": [{"role": "user", "content": [{"type": ["input_text"], "text": "x"}]}], "questions": [P]},
+        {"input": "x", "questions": [{"type": {}, "instructions": "x"}]},
+        {"input": "x", "questions": [{"type": ["predicate"], "instructions": "x"}]},
+        {"input": [{"role": "user", "content": []}], "questions": [P]},
+        {"input": image_input("data:image/png;base64,"), "questions": [CATEGORY]},
+    ],
+)
+def test_malformed_client_values_are_400_with_a_param(client, auth, echo, body):
+    err = assert_error(post(client, auth, body), 400, "invalid_request")
+    assert err["param"]
+    assert predict_calls(echo) == [] and classify_calls(echo) == []
+
+
+def test_non_finite_json_numbers_are_rejected(client, auth, echo):
+    raw = b'{"input": [{"role": "user", "content": [{"type": "input_json", "data": {"x": NaN}}]}], "questions": [{"type": "predicate", "instructions": "x"}]}'
+    assert_error(client.post(DECISIONS, content=raw, headers=auth), 400, "invalid_request")
+    raw = b'{"state": {"x": Infinity}, "questions": {"q": {"type": "noul", "instructions": "x"}}}'
+    assert_error(client.post("/v1/decide/text", content=raw, headers=auth), 400, "invalid_request")
+    raw = b'{"input": [{"role": "user", "content": [{"type": "input_json", "data": {"x": 1e999}}]}], "questions": [{"type": "predicate", "instructions": "x"}]}'
+    assert_error(client.post(DECISIONS, content=raw, headers=auth), 400, "invalid_request")
+    raw = b'{"state": {"x": -1e999}, "questions": {"q": {"type": "noul", "instructions": "x"}}}'
+    assert_error(client.post("/v1/decide/text", content=raw, headers=auth), 400, "invalid_request")
+    assert predict_calls(echo) == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"type": "choice", "choice": ["billing"], "probabilities": {}, "confidence": 0.5},
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": float("nan")}, "confidence": 0.5},
+        {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.5}, "confidence": float("inf")},
+    ],
+)
+def test_malformed_laya_answers_are_502(client, auth, backends, answer):
+    def reply(request):
+        body = json.dumps({"answers": {"department": answer}}, allow_nan=True)
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "application/json"})
+
+    backends.text = reply
+    assert_error(
+        post(client, auth, {"model": "gpt-6-luna", "input": "x", "questions": [DEPARTMENT]}),
+        502,
+        "backend_error",
+        "server_error",
+    )
+
+
+@pytest.mark.parametrize("result", [{"label": ["dog"], "score": 0.9}, {"label": "dog", "score": float("nan")}])
+def test_malformed_siglip_results_are_502(client, auth, backends, result):
+    def reply(request):
+        body = json.dumps({"results": [result]}, allow_nan=True)
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "application/json"})
+
+    backends.image = reply
+    assert_error(
+        post(client, auth, {"model": "gpt-6-luna", "input": image_input(PNG_URL), "questions": [CATEGORY]}),
+        502,
+        "backend_error",
+        "server_error",
+    )
