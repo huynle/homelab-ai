@@ -18,8 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin app
 
-COPY app.py adapters.py admin.py admin_pages.py config.py db.py errors.py keyservice.py keystore.py metrics.py \
-     models.py oidc.py registry.py sessions.py usage.py ./
+COPY app.py adapters.py admin.py admin_pages.py config.py db.py decisions.py errors.py keyservice.py keystore.py \
+     metrics.py models.py oidc.py registry.py sessions.py usage.py ./
 COPY migrations/ ./migrations/
 COPY admin_static/ ./admin_static/
 
