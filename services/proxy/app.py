@@ -437,9 +437,13 @@ def create_app(
             *(invoke(request, entry, explicit, p, r) for p, r in zip(payloads, reqs, strict=True))
         )
         model = request.state.model = results[0].model
-        if plan.image is None:
-            return JSONResponse(decisions.render_text(plan, model, [(r.results, r.meta) for r in results]))
-        return JSONResponse(decisions.render_image(plan, model, [r.results for r in results]))
+        if plan.image is not None:
+            return JSONResponse(decisions.render_image(plan, model, [r.results for r in results]))
+        response = JSONResponse(decisions.render_text(plan, model, [(r.results, r.meta) for r in results]))
+        if plan.image_ignored:  # OpenAI's Decision object has no field for this
+            response.headers["X-Decision-Image"] = "ignored"
+            mx.observe_image_ignored(model)
+        return response
 
     @app.get("/v1/health")
     async def health(request: Request):

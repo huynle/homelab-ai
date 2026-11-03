@@ -8,6 +8,8 @@ adding it to the dict.
 from __future__ import annotations
 
 import json
+import math
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlsplit
@@ -41,8 +43,30 @@ class Call:
 
 # ---------------------------------------------------------------- backend HTTP
 
+# Absolute filesystem paths (POSIX with at least two segments, or Windows drive paths) in backend messages.
+_PATH = re.compile(r"(?<![\w:/.])/(?:[^\s/]+/)+[^\s]*|\b[A-Za-z]:\\[^\s]*")
+
+
+def _redact(message: str) -> str:
+    return _PATH.sub("[path]", message)
+
+
+def _finite(value: Any) -> bool:
+    """Every number in a decoded backend JSON value is finite (Python's json accepts NaN and Infinity)."""
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return all(_finite(v) for v in value)
+    return True
+
 
 def _backend_message(resp: httpx.Response) -> str:
+    return _redact(_raw_backend_message(resp))
+
+
+def _raw_backend_message(resp: httpx.Response) -> str:
     try:
         data = resp.json()
     except ValueError:
@@ -100,6 +124,8 @@ async def call_backend(
         data = None
     if not isinstance(data, dict):
         raise ApiError("backend_error", f"{name} backend returned an unparseable response", **err_fields)
+    if not _finite(data):
+        raise ApiError("backend_error", f"{name} backend returned a non-finite number", **err_fields)
     return data
 
 

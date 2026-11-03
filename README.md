@@ -128,8 +128,10 @@ decision = client.decisions.create(
 print(decision.answers[0].choice)
 ```
 
-Text, JSON and conversations are answered by Laya. A request with one base64 image and only `choice`
-questions is answered by SigLIP2; other image requests and hosted image URLs return 400. See the
+Text, JSON and conversations are answered by Laya. Text wins over images: an image sent together with
+text or JSON is ignored (the response says so with `X-Decision-Image: ignored`), and only an image on its
+own, with `choice` questions, is answered by SigLIP2. Hosted image URLs and more than one image return
+400. See the
 [contract](api/decision-api.yaml) (`createDecision`) for the mapping and limits.
 
 Typical latency through the public route from the LAN: text decisions about 0.16–0.26 s, image

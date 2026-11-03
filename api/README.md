@@ -1,6 +1,6 @@
 # Decision API v1
 
-`decision-api.yaml` (OpenAPI 3.1.0, version 1.3.0) is the contract for a small proxy served at
+`decision-api.yaml` (OpenAPI 3.1.0, version 1.4.0) is the contract for a small proxy served at
 `https://decide.ai.huynle.com` (k3s). It sits in front of two backends on the `ml` VM (`10.1.10.10`):
 
 | Route | Backend | Task |
@@ -44,9 +44,11 @@ out, with answers in question order. The OpenAI SDK works with `base_url` set to
 - `gpt-6-luna` means the default model; registry ids and Laya checkpoint names pin a model.
 - Text, JSON and conversations go to Laya (`predicate` -> `noul`). Requests with more than 32
   questions are split across several Laya calls.
-- One base64 PNG or JPEG image with only `choice` questions goes to SigLIP2, one zero-shot
-  classification per question over its choice values. Other image requests, hosted image URLs and
-  images in question instructions return 400.
+- Images, text wins: one base64 PNG or JPEG image with text or JSON evidence goes to Laya on that
+  evidence alone; the image is ignored and the response carries `X-Decision-Image: ignored`. Only an
+  image with nothing else goes to SigLIP2, with `choice` questions only (one zero-shot classification
+  per question over its choice values). Hosted image URLs, more than one image and images in question
+  instructions return 400.
 - Limits: 400 questions, 64 choices, 10 levels, 2048-character instructions, 32 KiB of text input.
 - `prompt_cache_*` and `safety_identifier` are accepted and ignored; `usage` cache and reasoning
   counts are 0.
@@ -71,7 +73,9 @@ Success responses use one shape:
   including defaults (`pad_to_square` is off unless the client sends `true`).
 
 Failures return `{"error": {"code", "message", "type", "param"}}`; `type` and `param` follow OpenAI's
-error object (`invalid_request_error`, `authentication_error` or `server_error`, and the offending field or null). The `model` fields appear only once a model has
+error object (`invalid_request_error`, `authentication_error` or `server_error`, and the offending field or null).
+A backend's own 4xx message is passed on with filesystem paths replaced by `[path]`; a backend reply that
+contains NaN or Infinity is a 502 `backend_error`. The `model` fields appear only once a model has
 been resolved. Each code maps to one HTTP status:
 
 | code | HTTP |

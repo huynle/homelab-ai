@@ -7,7 +7,7 @@ model backends listed in its [backend registry](#backend-registry):
 |---|---|
 | `POST /v1/decide/text` | `text-decision` model, Laya adapter: `POST {backend_url}/predict` |
 | `POST /v1/classify/image` | `image-zero-shot` model, zero-shot-image adapter: `POST {backend_url}/classify` |
-| `POST /v1/decisions` | OpenAI Decisions format, translated by `decisions.py` onto the Laya adapter (one call per 32 questions) or, for one image with choice questions, the zero-shot-image adapter (one call per question) |
+| `POST /v1/decisions` | OpenAI Decisions format, translated by `decisions.py` onto the Laya adapter (one call per 32 questions) or, for an image with no text or JSON evidence and only choice questions, the zero-shot-image adapter (one call per question); an image that comes with text is ignored (`X-Decision-Image: ignored`) |
 | `GET /v1/health` | `GET {backend_url}/health` once per distinct backend (public, no auth) |
 | `GET /v1/models` | the registry entries |
 | `GET /healthz` | none: process liveness for Kubernetes (public, no auth, not access-logged) |
@@ -436,6 +436,7 @@ The proxy runs as a single uvicorn process, so no multiprocess mode is used.
 | `decision_api_request_duration_seconds` | histogram | `route`, `model` |
 | `decision_api_backend_request_duration_seconds` | histogram | `model` |
 | `decision_api_backend_errors_total` | counter | `model`, `error_code` |
+| `decision_api_decision_images_ignored_total` | counter | `model` (`POST /v1/decisions` requests whose image was ignored because text or JSON came with it) |
 | `decision_api_backend_up` | gauge | `model` |
 | `decision_api_build_info` | gauge (always 1) | `version`, `registry_models` |
 
