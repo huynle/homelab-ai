@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 import admin as admin_mod
+import decisions
 import metrics
 import oidc
 from adapters import ADAPTERS, Call, Result
@@ -343,9 +344,7 @@ def create_app(
     def client(request: Request) -> httpx.AsyncClient:
         return request.app.state.http
 
-    async def run(request: Request, task: str, data: dict, req) -> JSONResponse:
-        entry, explicit = registry.resolve(task, req.model)
-        request.state.model = entry.id
+    async def invoke(request: Request, entry, explicit: bool, data: dict, req) -> Result:
         call = Call(client(request), entry, explicit, registry)
         started = time.perf_counter()
         try:
@@ -357,6 +356,12 @@ def create_app(
             mx.observe_backend(entry.id, time.perf_counter() - started, "internal_error")
             raise
         mx.observe_backend(entry.id, time.perf_counter() - started)
+        return result
+
+    async def run(request: Request, task: str, data: dict, req) -> JSONResponse:
+        entry, explicit = registry.resolve(task, req.model)
+        request.state.model = entry.id
+        result = await invoke(request, entry, explicit, data, req)
         request.state.model = result.model  # Laya may report the checkpoint it routed to
         return JSONResponse(
             {
@@ -398,6 +403,31 @@ def create_app(
         except (binascii.Error, ValueError):
             raise ApiError("invalid_request", "image.base64: not valid standard base64") from None
         return await run(request, IMAGE_TASK, data, req)
+
+    @app.post("/v1/decisions")
+    async def create_decision(request: Request):
+        """OpenAI Decisions API wire format (see decisions.py)."""
+        plan = decisions.parse(_require_object(await read_json(request, IMAGE_BODY_LIMIT)))
+        task = TEXT_TASK if plan.image is None else IMAGE_TASK
+        try:
+            entry, explicit = registry.resolve(task, plan.model)
+        except ApiError as exc:
+            exc.param = "model"
+            raise
+        request.state.model = entry.id
+        if plan.image is None:
+            payloads = decisions.laya_payloads(plan)
+            reqs = [_validate(TextDecisionRequest, p) for p in payloads]
+        else:
+            payloads = decisions.siglip_payloads(plan)
+            reqs = [_validate(ImageClassifyRequest, p) for p in payloads]
+        results = await asyncio.gather(
+            *(invoke(request, entry, explicit, p, r) for p, r in zip(payloads, reqs, strict=True))
+        )
+        model = request.state.model = results[0].model
+        if plan.image is None:
+            return JSONResponse(decisions.render_text(plan, model, [(r.results, r.meta) for r in results]))
+        return JSONResponse(decisions.render_image(plan, model, [r.results for r in results]))
 
     @app.get("/v1/health")
     async def health(request: Request):

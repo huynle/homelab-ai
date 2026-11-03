@@ -7,6 +7,7 @@ model backends listed in its [backend registry](#backend-registry):
 |---|---|
 | `POST /v1/decide/text` | `text-decision` model, Laya adapter: `POST {backend_url}/predict` |
 | `POST /v1/classify/image` | `image-zero-shot` model, zero-shot-image adapter: `POST {backend_url}/classify` |
+| `POST /v1/decisions` | OpenAI Decisions format, translated by `decisions.py` onto the Laya adapter (one call per 32 questions) or, for one image with choice questions, the zero-shot-image adapter (one call per question) |
 | `GET /v1/health` | `GET {backend_url}/health` once per distinct backend (public, no auth) |
 | `GET /v1/models` | the registry entries |
 | `GET /healthz` | none: process liveness for Kubernetes (public, no auth, not access-logged) |
@@ -45,6 +46,8 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 - `metrics.py`: Prometheus metrics (per-app registry) and the separate metrics HTTP server
 - `registry.example.yaml`: registry for the `ml` backends on the LAN
 - `Dockerfile`: container image (non-root, listens on `0.0.0.0:8080`)
+- `decisions.py`: `POST /v1/decisions` (OpenAI Decisions wire format): request validation with OpenAI-style
+  `param` paths, input rendering (text, JSON, transcripts), Laya and SigLIP2 payloads, and answer mapping
 - `models.py`: Pydantic request models and limits that mirror the spec's component schemas
 - `errors.py`: the `ApiError` code -> HTTP status table and the `ErrorEnvelope` response
 - `tests/`: pytest suite. Backends are mocked with `httpx.MockTransport` using the real captures in
@@ -438,7 +441,7 @@ The proxy runs as a single uvicorn process, so no multiprocess mode is used.
 
 Labels:
 
-- `route`: the route template (`/v1/decide/text`, `/v1/classify/image`, `/v1/health`, `/v1/models`).
+- `route`: the route template (`/v1/decide/text`, `/v1/classify/image`, `/v1/decisions`, `/v1/health`, `/v1/models`).
   Any other path is `other`, so scanners cannot create new series. With the admin page on, every `/admin`
   path is the single value `admin` (with `key_id="none"`: bearer keys are never checked there).
 - `model`: the registry id that served the request (for Laya without `model`, the checkpoint it routed to),

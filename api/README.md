@@ -1,12 +1,13 @@
 # Decision API v1
 
-`decision-api.yaml` (OpenAPI 3.1.0, version 1.2.0) is the contract for a small proxy served at
+`decision-api.yaml` (OpenAPI 3.1.0, version 1.3.0) is the contract for a small proxy served at
 `https://decide.ai.huynle.com` (k3s). It sits in front of two backends on the `ml` VM (`10.1.10.10`):
 
 | Route | Backend | Task |
 |---|---|---|
 | `POST /v1/decide/text` | Laya (`laya[serve]` 0.4.20, `ml:8000/predict`) | typed text decisions: `choice`, `score`, `noul` |
 | `POST /v1/classify/image` | SigLIP2 `google/siglip2-base-patch16-224` @ `75de2d55` | zero-shot image classification |
+| `POST /v1/decisions` | Laya, or SigLIP2 for one image | [OpenAI Decisions API](https://developers.openai.com/api/reference/resources/decisions/methods/create) wire format |
 | `GET /v1/health` | every backend | readiness (public, no auth) |
 | `GET /v1/models` | registry | served models |
 | `GET /healthz` | none | proxy liveness (public, no auth) |
@@ -32,6 +33,27 @@ the task is used. Text requests may still send a Laya checkpoint name such as `e
 - **OpenAPI 3.1.** JSON Schema 2020-12 dialect: `const`, discriminated `oneOf` for question and
   answer types, and `contentEncoding: base64`.
 
+## OpenAI Decisions API
+
+`POST /v1/decisions` follows OpenAI's Decisions wire format instead of the envelope below: `model`,
+`input` (a string or an array of messages, tool calls and tool outputs) and `questions`
+(`[{type: predicate|choice|score, name, instructions, choices|levels}]`) in; `{model, answers, usage}`
+out, with answers in question order. The OpenAI SDK works with `base_url` set to
+`https://decide.ai.huynle.com/v1`.
+
+- `gpt-6-luna` means the default model; registry ids and Laya checkpoint names pin a model.
+- Text, JSON and conversations go to Laya (`predicate` -> `noul`). Requests with more than 32
+  questions are split across several Laya calls.
+- One base64 PNG or JPEG image with only `choice` questions goes to SigLIP2, one zero-shot
+  classification per question over its choice values. Other image requests, hosted image URLs and
+  images in question instructions return 400.
+- Limits: 400 questions, 64 choices, 10 levels, 2048-character instructions, 32 KiB of text input.
+- `prompt_cache_*` and `safety_identifier` are accepted and ignored; `usage` cache and reasoning
+  counts are 0.
+
+The OpenRouter Decisions (Jev) format is a different wire format (`state`, `questions` keyed by id,
+`noul`); it is planned at its own native path, `POST /api/alpha/decisions`, not on `/v1/decisions`.
+
 ## Envelope
 
 Success responses use one shape:
@@ -48,7 +70,8 @@ Success responses use one shape:
   For images, `meta.hypothesis_template` and `meta.pad_to_square` report the effective values,
   including defaults (`pad_to_square` is off unless the client sends `true`).
 
-Failures return `{"error": {"code", "message"}}`. The `model` fields appear only once a model has
+Failures return `{"error": {"code", "message", "type", "param"}}`; `type` and `param` follow OpenAI's
+error object (`invalid_request_error`, `authentication_error` or `server_error`, and the offending field or null). The `model` fields appear only once a model has
 been resolved. Each code maps to one HTTP status:
 
 | code | HTTP |

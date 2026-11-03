@@ -160,7 +160,12 @@ def test_sqlite_mode_revocation_is_immediate(sqlite_app):
         ks.revoke_key(db, owner, created["id"])
         resp = c.get("/v1/models", headers=auth)
         assert resp.status_code == 401
-        assert resp.json()["error"] == {"code": "unauthorized", "message": "missing or invalid API key"}
+        assert resp.json()["error"] == {
+            "code": "unauthorized",
+            "message": "missing or invalid API key",
+            "type": "authentication_error",
+            "param": None,
+        }
 
 
 def test_sqlite_mode_imports_sops_key_keeping_hash_key_id(sqlite_app, sqlite_settings, backends, caplog):
