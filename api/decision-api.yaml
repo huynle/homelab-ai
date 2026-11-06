@@ -351,9 +351,10 @@ paths:
         KServe V2-style readiness rolled up across backends. `ok` when every backend is ok,
         `degraded` when at least one (but not all) is down, `down` when none is usable.
         Returns 200 for `ok` and `degraded`, 503 for `down`. No authentication.
-        Every distinct backend in the registry is probed once. `backends.text` and `backends.image`
+        Every distinct local backend in the registry is probed once. `backends.text` and `backends.image`
         report the backends of the default models; `models` reports the backend status of every
-        served model by id.
+        local model by id. Paid OpenRouter models are not probed and do not affect `status`; they are
+        listed under `upstreams`.
       security: []
       responses:
         "200":
@@ -416,6 +417,12 @@ paths:
       tags: [ops]
       operationId: listModels
       summary: List served models (KServe V2-style model repository listing).
+      description: |
+        Every registry model with its task, backend, capabilities and whether it is `paid` (served by
+        OpenRouter, only for keys with paid access). Models with task `decisions` and every alias are
+        reachable only through `POST /api/alpha/decisions`. `aliases` lists the registry aliases: `text`
+        is the model used for text-only requests, `image` the one used when a request has media parts,
+        `assets` or box questions (the same id twice for a single-target alias).
       responses:
         "200":
           description: Served models.
@@ -428,10 +435,22 @@ paths:
                   summary: Built from api/fixtures/laya-models.json plus the pinned SigLIP2 commit
                   value:
                     models:
-                      - {id: laya-english, task: text-decision, backend: laya, version: laya-serve-0.4.20}
-                      - {id: laya-multilingual, task: text-decision, backend: laya, version: laya-serve-0.4.20}
-                      - {id: laya-typed-decisions, task: text-decision, backend: laya, version: laya-serve-0.4.20}
-                      - {id: siglip2-base-patch16-224, task: image-zero-shot, backend: siglip2, version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2}
+                      - {id: laya-english, task: text-decision, backend: laya, version: laya-serve-0.4.20, capabilities: [text], paid: false}
+                      - {id: laya-multilingual, task: text-decision, backend: laya, version: laya-serve-0.4.20, capabilities: [text], paid: false}
+                      - {id: laya-typed-decisions, task: text-decision, backend: laya, version: laya-serve-0.4.20, capabilities: [text], paid: false}
+                      - {id: siglip2-base-patch16-224, task: image-zero-shot, backend: siglip2, version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2, capabilities: [image], paid: false}
+                    aliases: []
+                example_registry:
+                  summary: services/proxy/registry.example.yaml (adds the paid OpenRouter model jev and the alias auto)
+                  value:
+                    models:
+                      - {id: laya-english, task: text-decision, backend: laya, version: laya-serve-0.4.20, capabilities: [text], paid: false}
+                      - {id: laya-multilingual, task: text-decision, backend: laya, version: laya-serve-0.4.20, capabilities: [text], paid: false}
+                      - {id: laya-typed-decisions, task: text-decision, backend: laya, version: laya-serve-0.4.20, capabilities: [text], paid: false}
+                      - {id: siglip2-base-patch16-224, task: image-zero-shot, backend: siglip2, version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2, capabilities: [image], paid: false}
+                      - {id: jev, task: decisions, backend: openrouter, version: jev-1.14, capabilities: [text, image, box], paid: true, backend_model: typesafe/jev-1.14}
+                    aliases:
+                      - {id: auto, text: laya-english, image: jev}
         "401": {$ref: "#/components/responses/Unauthorized"}
         "500": {$ref: "#/components/responses/InternalError"}
 components:
@@ -1133,8 +1152,21 @@ components:
             image: {$ref: "#/components/schemas/BackendHealth"}
         models:
           type: object
-          description: Model id -> status of the backend serving it (every model in `GET /v1/models`).
+          description: Model id -> status of the backend serving it (every local model in `GET /v1/models`).
           additionalProperties: {$ref: "#/components/schemas/BackendHealth"}
+        upstreams:
+          type: object
+          description: |
+            Paid OpenRouter models (present only when the registry has some). They are never probed
+            (OpenRouter has no health endpoint) and never change `status`; `configured` is false when
+            the proxy has no OpenRouter key, in which case requests for them get 503.
+          additionalProperties:
+            type: object
+            required: [status, configured]
+            additionalProperties: false
+            properties:
+              status: {const: not_probed}
+              configured: {type: boolean}
     Liveness:
       type: object
       required: [status]
@@ -1142,12 +1174,23 @@ components:
         status: {type: string, const: ok}
     Model:
       type: object
-      required: [id, task, backend, version]
+      required: [id, task, backend, version, capabilities, paid]
       properties:
         id: {type: string}
         task:
           type: string
-          enum: [text-decision, image-zero-shot]
+          enum: [text-decision, image-zero-shot, decisions]
+          description: "`decisions`: an OpenRouter model, served only by `POST /api/alpha/decisions`."
+        capabilities:
+          type: array
+          description: What the model accepts in `POST /api/alpha/decisions` (box = box questions).
+          items: {type: string, enum: [text, image, box, audio, video]}
+        paid:
+          type: boolean
+          description: Served by OpenRouter at a cost; only API keys with paid access may use it.
+        backend_model:
+          type: string
+          description: The upstream OpenRouter model id (paid models only).
         backend:
           type: string
           description: Backend kind (the registry entry's label, by default its adapter).
@@ -1157,8 +1200,20 @@ components:
           description: Backend package version or pinned model commit.
     ModelList:
       type: object
-      required: [models]
+      required: [models, aliases]
       properties:
         models:
           type: array
           items: {$ref: "#/components/schemas/Model"}
+        aliases:
+          type: array
+          description: Registry aliases (POST /api/alpha/decisions only).
+          items: {$ref: "#/components/schemas/ModelAlias"}
+    ModelAlias:
+      type: object
+      required: [id, text, image]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        text: {type: string, description: Model id serving text-only requests.}
+        image: {type: string, description: Model id serving requests with media, assets or box questions.}

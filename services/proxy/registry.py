@@ -221,7 +221,9 @@ class Registry(BaseModel):
         if entry is None:
             shown = name if len(name) <= 80 else name[:80] + "..."
             valid = ", ".join([m.id for m in self.models] + list(self.aliases))
-            raise ApiError("invalid_request", f"unknown model {shown!r}; valid models and aliases: {valid}", param="model")
+            raise ApiError(
+                "invalid_request", f"unknown model {shown!r}; valid models and aliases: {valid}", param="model"
+            )
         return entry
 
     def resolve(self, task: str, name: str | None) -> tuple[ModelEntry, bool]:

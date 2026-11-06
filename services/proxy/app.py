@@ -29,7 +29,7 @@ import decisions
 import metrics
 import oidc
 from adapters import ADAPTERS, Call, Result
-from config import Settings
+from config import Settings, read_openrouter_key
 from db import utcnow
 from errors import ApiError, error_response
 from keystore import FileKeyStore, KeyStore, SqliteKeyStore, bearer_token, legacy_key_id
@@ -238,12 +238,20 @@ def create_app(
             log.warning("DECISION_API_ALLOW_NO_AUTH=1: serving without authentication")
 
     backend_urls = registry.backend_urls()
+    upstream_models = [m for m in registry.models if not m.probed]
+    openrouter_key = read_openrouter_key(settings.openrouter_key_file)
+    if upstream_models and openrouter_key is None:
+        log.warning(
+            "registry has OpenRouter models (%s) but DECISION_API_OPENROUTER_KEY_FILE is not set; "
+            "requests for them get 503 backend_unavailable",
+            ", ".join(m.id for m in upstream_models),
+        )
 
     async def probe_backends(http: httpx.AsyncClient) -> dict[str, dict]:
         """Probe every distinct backend once and update ``backend_up`` for each model behind it."""
         probes = await asyncio.gather(*(probe(http, url, settings.health_timeout_s) for url in backend_urls))
         by_url = dict(zip(backend_urls, probes, strict=True))
-        for m in registry.models:
+        for m in registry.probed():
             mx.set_backend_up(m.id, by_url[m.backend_url]["status"] == "ok")
         return by_url
 
@@ -450,27 +458,42 @@ def create_app(
         by_url = await probe_backends(client(request))
         up = [p["status"] == "ok" for p in by_url.values()]
         status = "ok" if all(up) else "degraded" if any(up) else "down"
-        return JSONResponse(
-            {
-                "status": status,
-                "backends": {
-                    "text": by_url[registry.default(TEXT_TASK).backend_url],
-                    "image": by_url[registry.default(IMAGE_TASK).backend_url],
-                },
-                "models": {m.id: by_url[m.backend_url] for m in registry.models},
+        body: dict[str, Any] = {
+            "status": status,
+            "backends": {
+                "text": by_url[registry.default(TEXT_TASK).backend_url],
+                "image": by_url[registry.default(IMAGE_TASK).backend_url],
             },
-            status_code=503 if status == "down" else 200,
-        )
+            "models": {m.id: by_url[m.backend_url] for m in registry.probed()},
+        }
+        if upstream_models:  # paid upstreams have no health endpoint: listed, never probed, never degrade status
+            body["upstreams"] = {
+                m.id: {"status": "not_probed", "configured": openrouter_key is not None} for m in upstream_models
+            }
+        return JSONResponse(body, status_code=503 if status == "down" else 200)
 
     @app.get(LIVENESS_PATH)
     async def healthz():
         return {"status": "ok"}
 
-    models = [{"id": m.id, "task": m.task, "backend": m.backend, "version": m.version} for m in registry.models]
+    models = []
+    for m in registry.models:
+        item = {
+            "id": m.id,
+            "task": m.task,
+            "backend": m.backend,
+            "version": m.version,
+            "capabilities": m.capabilities,
+            "paid": m.paid,
+        }
+        if m.paid:  # the upstream model id; local checkpoints stay internal
+            item["backend_model"] = m.backend_model
+        models.append(item)
+    aliases = registry.alias_list()
 
     @app.get("/v1/models")
     async def list_models():
-        return {"models": models}
+        return {"models": models, "aliases": aliases}
 
     if admin is not None:
         admin_mod.install(app, admin)

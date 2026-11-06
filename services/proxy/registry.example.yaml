@@ -1,17 +1,28 @@
 # Decision API backend registry. Point DECISION_API_REGISTRY_FILE at a copy of this file.
 #
 # Each entry is one model the proxy serves. `id` is what clients send as `model` and what /v1/models lists.
-#   task          text-decision (POST /v1/decide/text) or image-zero-shot (POST /v1/classify/image)
-#   adapter       how the backend is called: laya | zero-shot-image
+#   task          text-decision (POST /v1/decide/text), image-zero-shot (POST /v1/classify/image) or
+#                 decisions (OpenRouter models; served only by POST /api/alpha/decisions)
+#   adapter       how the backend is called: laya | zero-shot-image | openrouter
 #   backend_url   base URL of the backend (no trailing path); /health is probed by GET /v1/health
-#   backend_model optional value forwarded to the backend (Laya `model`, i.e. the checkpoint)
+#                 (openrouter entries: an https URL such as https://openrouter.ai/api; never probed)
+#   backend_model optional value forwarded to the backend (Laya `model`, i.e. the checkpoint);
+#                 required for openrouter: the OpenRouter model id, e.g. typesafe/jev-1.14
+#   capabilities  openrouter only, required: what the model accepts (text, image, box, audio, video).
+#                 Local backends are fixed: laya = text, zero-shot-image = image (choice questions only)
 #   backend       optional label shown as `backend` in /v1/models (default: the adapter key)
 #   version       reported as `model_version` (package version or pinned model commit)
 #   timeout_s     optional request timeout in seconds (default 10)
 #
 # `defaults` picks the model for requests that do not send `model`. For Laya, an unpinned request keeps
 # Laya's automatic script/language routing; the response reports the checkpoint Laya actually used.
-# The file holds no secrets; API keys come from DECISION_API_KEYS_FILE.
+# The file holds no secrets; API keys come from DECISION_API_KEYS_FILE and the OpenRouter key from
+# DECISION_API_OPENROUTER_KEY_FILE. OpenRouter models are paid: only API keys the owner granted paid access
+# (admin page) may use them.
+#
+# `aliases` are extra names for POST /api/alpha/decisions only. `name: <model id>` always serves that model;
+# `name: {text: <id>, image: <id>}` picks `image` when the request has image/audio/video parts, assets or
+# box questions, and `text` otherwise. Aliases must name model ids (not other aliases or new ids).
 
 defaults:
   text: laya-english
@@ -46,3 +57,15 @@ models:
     backend_url: http://10.1.10.10:8010
     version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
     timeout_s: 10
+  - id: jev
+    task: decisions
+    adapter: openrouter
+    backend_url: https://openrouter.ai/api
+    backend_model: typesafe/jev-1.14
+    capabilities: [text, image, box]
+    version: jev-1.14
+    timeout_s: 60
+
+aliases:
+  # text-only requests stay on the free local Laya; images and box questions go to the paid Jev
+  auto: {text: laya-english, image: jev}

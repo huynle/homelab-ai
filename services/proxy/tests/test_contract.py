@@ -104,7 +104,7 @@ def test_example_registry_models_match_spec_example(spec, backends, validate):
         body = c.get("/v1/models", headers={"Authorization": f"Bearer {API_KEY}"}).json()
     validate(body, "ModelList")
     example = spec["paths"]["/v1/models"]["get"]["responses"]["200"]["content"]["application/json"]["examples"]
-    assert body == example["current"]["value"]
+    assert body == example["example_registry"]["value"]
 
 
 def test_image_request_may_name_a_model(image_request, validate):

@@ -376,20 +376,36 @@ def test_health_does_not_forward_authorization(client, auth, backends):
 
 
 def test_models_lists_contract_models(client, auth):
+    TEXT = {"capabilities": ["text"], "paid": False}
+    IMAGE = {"capabilities": ["image"], "paid": False}
     resp = client.get("/v1/models", headers=auth)
     assert resp.status_code == 200
     assert resp.json() == {
         "models": [
-            {"id": "laya-english", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
-            {"id": "laya-multilingual", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
-            {"id": "laya-typed-decisions", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
+            {"id": "laya-english", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20", **TEXT},
+            {
+                "id": "laya-multilingual",
+                "task": "text-decision",
+                "backend": "laya",
+                "version": "laya-serve-0.4.20",
+                **TEXT,
+            },
+            {
+                "id": "laya-typed-decisions",
+                "task": "text-decision",
+                "backend": "laya",
+                "version": "laya-serve-0.4.20",
+                **TEXT,
+            },
             {
                 "id": "siglip2-base-patch16-224",
                 "task": "image-zero-shot",
                 "backend": "siglip2",
                 "version": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+                **IMAGE,
             },
-        ]
+        ],
+        "aliases": [],
     }
 
 
