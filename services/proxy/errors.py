@@ -9,7 +9,9 @@ from fastapi.responses import JSONResponse
 STATUS = {
     "invalid_request": 400,
     "unauthorized": 401,
+    "forbidden": 403,
     "payload_too_large": 413,
+    "rate_limited": 429,
     "internal_error": 500,
     "backend_error": 502,
     "backend_unavailable": 503,
@@ -21,6 +23,8 @@ TYPE = {
     "invalid_request": "invalid_request_error",
     "payload_too_large": "invalid_request_error",
     "unauthorized": "authentication_error",
+    "forbidden": "permission_error",
+    "rate_limited": "rate_limit_error",
 }
 
 

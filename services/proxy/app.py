@@ -28,7 +28,8 @@ import admin as admin_mod
 import decisions
 import metrics
 import oidc
-from adapters import ADAPTERS, Call, Result
+import openrouter_decisions as alpha
+from adapters import ADAPTERS, Call, Result, Upstream
 from config import Settings, read_openrouter_key
 from db import utcnow
 from errors import ApiError, error_response
@@ -246,6 +247,7 @@ def create_app(
             "requests for them get 503 backend_unavailable",
             ", ".join(m.id for m in upstream_models),
         )
+    upstream = None if openrouter_key is None else Upstream(openrouter_key, referer=settings.openrouter_referer)
 
     async def probe_backends(http: httpx.AsyncClient) -> dict[str, dict]:
         """Probe every distinct backend once and update ``backend_up`` for each model behind it."""
@@ -310,9 +312,15 @@ def create_app(
         openapi_url=None,
     )
 
+    def render_error(path: str, exc: ApiError, start: float):
+        """OpenRouter's error envelope on /api/alpha/*, the contract's ErrorEnvelope everywhere else."""
+        if alpha.is_alpha_path(path):
+            return alpha.error_response(exc)
+        return error_response(exc, _ms(start))
+
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError):
-        return error_response(exc, _ms(request.state.start))
+        return render_error(request.url.path, exc, request.state.start)
 
     @app.middleware("http")
     async def access_and_auth(request: Request, call_next):
@@ -329,9 +337,10 @@ def create_app(
                 token = bearer_token(request.headers.get("authorization"))
                 principal = keystore.authenticate(token) if token else None
                 if principal is None:
-                    response = error_response(ApiError("unauthorized", "missing or invalid API key"), _ms(start))
+                    response = render_error(path, ApiError("unauthorized", "missing or invalid API key"), start)
                 else:
                     kid = principal.key_id
+                    request.state.principal = principal
                     response = await call_next(request)
             else:
                 response = await call_next(request)
@@ -340,7 +349,7 @@ def create_app(
             if admin_path and admin is not None:
                 response = admin_mod.error_json("internal_error", "unexpected error")
             else:
-                response = error_response(ApiError("internal_error", "unexpected error"), _ms(start))
+                response = render_error(path, ApiError("internal_error", "unexpected error"), start)
         if admin_path and admin is not None:
             admin_mod.secure(response)
         latency_ms = _ms(start)
@@ -357,15 +366,18 @@ def create_app(
             )
         )
         mx.observe_request(path, model, response.status_code, kid, time.perf_counter() - start)
+        cost = getattr(request.state, "cost", 0.0)  # OpenRouter's usage.cost (finite, >= 0) for paid models
+        if cost and model:
+            mx.observe_cost(model, cost)
         if usage is not None and principal is not None and principal.public_id is not None:
-            usage.record(principal.public_id, mx.route(path), model, response.status_code, latency_ms)
+            usage.record(principal.public_id, mx.route(path), model, response.status_code, latency_ms, cost_usd=cost)
         return response
 
     def client(request: Request) -> httpx.AsyncClient:
         return request.app.state.http
 
     async def invoke(request: Request, entry, explicit: bool, data: dict, req) -> Result:
-        call = Call(client(request), entry, explicit, registry)
+        call = Call(client(request), entry, explicit, registry, upstream if entry.paid else None)
         started = time.perf_counter()
         try:
             result: Result = await ADAPTERS[entry.adapter].run(call, data, req)
@@ -452,6 +464,45 @@ def create_app(
             response.headers["X-Decision-Image"] = "ignored"
             mx.observe_image_ignored(model)
         return response
+
+    @app.post("/api/alpha/decisions")
+    async def alpha_decisions(request: Request):
+        """OpenRouter Decisions API wire format (see openrouter_decisions.py)."""
+        plan = alpha.parse(_require_object(await read_json(request, alpha.BODY_LIMIT)))
+        entry = registry.resolve_decision(plan.model, media=plan.media)
+        request.state.model = entry.id
+        alpha.check_model(entry, plan)
+        if entry.paid:
+            principal = getattr(request.state, "principal", None)
+            allowed = principal.allow_paid if principal is not None else settings.file_keys_allow_paid
+            if not allowed:  # before any upstream call
+                raise ApiError(
+                    "forbidden",
+                    f"this API key is not allowed to use paid model {entry.id!r}; "
+                    "ask the owner to enable paid models for it",
+                    param="model",
+                )
+            if upstream is None:
+                raise ApiError(
+                    "backend_unavailable", f"model {entry.id!r} is not available: no OpenRouter key is configured"
+                )
+            result = await invoke(request, entry, True, alpha.upstream_body(plan, entry.backend_model), None)
+            body = alpha.render_upstream(entry.id, result.results, result.meta)
+            request.state.cost = alpha.usage_cost(body)
+            return JSONResponse(body)
+        if entry.adapter == "zero-shot-image":
+            payloads = alpha.siglip_payloads(plan)
+            reqs = [_validate(ImageClassifyRequest, p) for p in payloads]
+        else:
+            payloads = alpha.laya_payloads(plan)
+            reqs = [_validate(TextDecisionRequest, p) for p in payloads]
+        results = await asyncio.gather(
+            *(invoke(request, entry, True, p, r) for p, r in zip(payloads, reqs, strict=True))
+        )
+        model = request.state.model = results[0].model
+        if entry.adapter == "zero-shot-image":
+            return JSONResponse(alpha.render_siglip(plan, model, [r.results for r in results]))
+        return JSONResponse(alpha.render_laya(plan, model, [(r.results, r.meta) for r in results]))
 
     @app.get("/v1/health")
     async def health(request: Request):

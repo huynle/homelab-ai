@@ -33,12 +33,22 @@ class Result:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Upstream:
+    """Credentials and attribution headers for OpenRouter. The key is never logged or returned."""
+
+    key: str = field(repr=False)
+    referer: str = "https://decide.ai.huynle.com"
+    title: str = "Homelab Decision API"
+
+
 @dataclass
 class Call:
     http: httpx.AsyncClient
     entry: ModelEntry
     explicit: bool  # the client named this model; False when it came from the registry defaults
     registry: Registry
+    upstream: Upstream | None = None  # set for paid (openrouter) entries
 
 
 # ---------------------------------------------------------------- backend HTTP
@@ -217,13 +227,68 @@ class ZeroShotImageAdapter(Adapter):
 
 
 class OpenRouterAdapter(Adapter):
-    """OpenRouter ``POST /api/alpha/decisions`` (paid): the client's request forwarded with the upstream model id."""
+    """OpenRouter ``POST /api/alpha/decisions`` (paid): the client's request forwarded with the upstream model id.
+
+    ``data`` is the body to send (see ``openrouter_decisions.upstream_body``). OpenRouter's answers, usage, id,
+    provider and annotations come back in ``Result.results`` / ``Result.meta``; the route renders them.
+    """
 
     task = "decisions"
     paid = True
+    CREDENTIALS_MESSAGE = "upstream rejected the request (credentials or credits)"
 
     async def run(self, call: Call, data: dict, req: Any) -> Result:
-        raise NotImplementedError
+        entry, upstream = call.entry, call.upstream
+        if upstream is None:
+            raise ApiError("backend_unavailable", f"model {entry.id!r} is not available: no OpenRouter key configured")
+        headers = {
+            "Authorization": f"Bearer {upstream.key}",
+            "HTTP-Referer": upstream.referer,
+            "X-Title": upstream.title,
+        }
+        try:
+            resp = await call.http.post(
+                f"{entry.backend_url}/alpha/decisions", json=data, headers=headers, timeout=entry.timeout_s
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise ApiError("backend_unavailable", "OpenRouter is unreachable") from None
+        except httpx.TimeoutException:
+            raise ApiError(
+                "backend_timeout", f"OpenRouter did not answer within {int(entry.timeout_s * 1000)} ms"
+            ) from None
+        except httpx.TransportError as exc:
+            raise ApiError("backend_error", f"OpenRouter connection failed ({type(exc).__name__})") from None
+
+        status = resp.status_code
+        if status != 200:
+            raise self._error(resp, upstream.key)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise ApiError("backend_error", "OpenRouter returned an unparseable response")
+        if not _finite(body):
+            raise ApiError("backend_error", "OpenRouter returned a non-finite number")
+        answers = body.get("answers")
+        if not isinstance(answers, dict) or not all(isinstance(a, dict) for a in answers.values()):
+            raise ApiError("backend_error", "OpenRouter returned an unexpected response")
+        meta = {k: body[k] for k in ("usage", "id", "provider", "annotations") if k in body}
+        return Result(entry.id, entry.version, answers, meta)
+
+    def _error(self, resp: httpx.Response, key: str) -> ApiError:
+        status = resp.status_code
+        if status in (400, 413, 422):
+            message = _backend_message(resp).replace(key, "[redacted]")
+            code = "payload_too_large" if status == 413 else "invalid_request"
+            return ApiError(code, f"upstream rejected the request: {message}")
+        if status in (401, 402, 403):
+            return ApiError("backend_error", self.CREDENTIALS_MESSAGE)
+        if status == 429:
+            return ApiError("rate_limited", "upstream rate limit reached; retry later")
+        if status == 503:
+            return ApiError("backend_unavailable", "upstream is temporarily unavailable (HTTP 503)")
+        return ApiError("backend_error", f"upstream returned HTTP {status}")
 
 
 ADAPTERS: dict[str, Adapter] = {
