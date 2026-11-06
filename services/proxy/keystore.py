@@ -44,6 +44,7 @@ class Principal:
     public_id: str | None
     owner_email: str | None
     source: str
+    allow_paid: bool = False  # may use paid (OpenRouter) models; read on every request, so changes apply at once
 
 
 class KeyStore(Protocol):
@@ -98,8 +99,9 @@ def bearer_token(header: str | None) -> str | None:
 class FileKeyStore:
     """The configured keys (key file and env), unchanged from before the SQLite store."""
 
-    def __init__(self, keys: Iterable[str]):
+    def __init__(self, keys: Iterable[str], allow_paid: bool = False):
         self._keys = tuple(keys)
+        self._allow_paid = allow_paid  # DECISION_API_FILE_KEYS_ALLOW_PAID (dev/tests); denied by default
 
     def authenticate(self, raw_key: str) -> Principal | None:
         presented = raw_key.encode()
@@ -109,7 +111,13 @@ class FileKeyStore:
                 found = key
         if found is None:
             return None
-        return Principal(key_id=legacy_key_id(found), public_id=None, owner_email=None, source=SOURCE_FILE)
+        return Principal(
+            key_id=legacy_key_id(found),
+            public_id=None,
+            owner_email=None,
+            source=SOURCE_FILE,
+            allow_paid=self._allow_paid,
+        )
 
 
 # ---------------------------------------------------------------- SQLite store
@@ -122,6 +130,7 @@ class _CachedKey:
     owner_email: str
     source: str
     expires_at: datetime | None
+    allow_paid: bool = False
 
 
 class SqliteKeyStore:
@@ -129,7 +138,8 @@ class SqliteKeyStore:
 
     Issued keys are found by the public id in the key, then the HMAC is compared in constant time. Imported
     (legacy) keys have no public id in their value and are found by their HMAC. Revoked keys are not cached;
-    expired keys (``expires_at <= now``) fail. All failures look the same to the caller.
+    expired keys (``expires_at <= now``) fail. All failures look the same to the caller. Every key write
+    (revoke, paid access) bumps the database generation, so the next request sees it.
     """
 
     def __init__(self, db: Database, pepper: bytes, now: Callable[[], datetime] = utcnow):
@@ -144,7 +154,8 @@ class SqliteKeyStore:
     def _load(self) -> tuple[dict[str, _CachedKey], dict[str, _CachedKey]]:
         with self._db.read() as conn:
             rows = conn.execute(
-                "SELECT public_id, key_hmac, owner_email, source, expires_at FROM api_keys WHERE revoked_at IS NULL"
+                "SELECT public_id, key_hmac, owner_email, source, expires_at, allow_paid FROM api_keys"
+                " WHERE revoked_at IS NULL"
             ).fetchall()
         by_id, by_hmac = {}, {}
         for r in rows:
@@ -154,6 +165,7 @@ class SqliteKeyStore:
                 r["owner_email"],
                 r["source"],
                 parse_iso(r["expires_at"]) if r["expires_at"] else None,
+                bool(r["allow_paid"]),
             )
             if key.source == SOURCE_ISSUED:
                 by_id[key.public_id] = key
@@ -183,4 +195,10 @@ class SqliteKeyStore:
         if key is None or (key.expires_at is not None and key.expires_at <= self._now()):
             return None
         kid = key.public_id if key.source == SOURCE_ISSUED else legacy_key_id(raw_key)
-        return Principal(key_id=kid, public_id=key.public_id, owner_email=key.owner_email, source=key.source)
+        return Principal(
+            key_id=kid,
+            public_id=key.public_id,
+            owner_email=key.owner_email,
+            source=key.source,
+            allow_paid=key.allow_paid,
+        )

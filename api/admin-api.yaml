@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Homelab Decision API - Admin
-  version: 1.0.0
+  version: 1.1.0
   summary: Sign-in, API key management, usage and audit for the decision API.
   description: |
     The admin page of the decision API proxy, served at `https://decide.ai.huynle.com/admin` on the
@@ -55,6 +55,10 @@ info:
     - Limits: `name` 1-64 characters; at most 20 active (not revoked, not expired) keys per member,
       no limit for the owner; `expires_at` is optional and must be in the future and at most
       2 years (730 days) after the request.
+    - `allow_paid` (default false): whether the key may use paid models (registry entries served by
+      OpenRouter, for example `jev`, on `POST /api/alpha/decisions` of the Decision API). Only the
+      owner changes it, with `PATCH /api/keys/{id}`; members see it read-only. The change applies to
+      the key's next request and is audited as `key.paid_access_changed`.
     - `rate_limit_rpm` is reserved for later. It is always `null` today, read-only, and ignored by
       the proxy. Requests that send it are rejected (400), because bodies allow no unknown fields.
     - Legacy key: the single key from the SOPS file is imported once as an owner key named
@@ -266,6 +270,7 @@ paths:
                         revoked_at: null
                         last_used_at: "2026-11-02T19:30:02Z"
                         rate_limit_rpm: null
+                        allow_paid: false
                       - id: p3r5t7v2z4cd
                         name: imported (SOPS)
                         prefix: imported…
@@ -277,6 +282,7 @@ paths:
                         revoked_at: null
                         last_used_at: "2026-11-02T19:41:55Z"
                         rate_limit_rpm: null
+                        allow_paid: false
                       - id: b6d2f4h7j3ef
                         name: old laptop
                         prefix: dk_b6d2f4h7j3ef_…
@@ -288,6 +294,7 @@ paths:
                         revoked_at: "2026-11-02T18:00:03Z"
                         last_used_at: null
                         rate_limit_rpm: null
+                        allow_paid: false
         "401": {$ref: "#/components/responses/Unauthorized"}
         "403": {$ref: "#/components/responses/Forbidden"}
         "400": {$ref: "#/components/responses/InvalidRequest"}
@@ -338,6 +345,7 @@ paths:
                     revoked_at: null
                     last_used_at: null
                     rate_limit_rpm: null
+                    allow_paid: false
         "400":
           description: "`invalid_request` - bad name, `expires_at` in the past or more than 2 years ahead, or unknown fields."
           content:
@@ -368,10 +376,13 @@ paths:
     patch:
       tags: [keys]
       operationId: updateKey
-      summary: Rename a key.
+      summary: Rename a key, or (owner only) change its paid model access.
       description: |
-        Only `name` can change. Members may rename their own keys; the owner may rename any key.
-        A revoked key cannot be renamed (409). An empty body is a no-op and returns the key.
+        `name` and `allow_paid` can change. Members may rename their own keys; the owner may rename
+        any key. Only the owner may send `allow_paid` (a member gets 403 `forbidden`, even for their
+        own key); it takes effect on the key's next request and is audited as
+        `key.paid_access_changed` (only when the value changes). A revoked key cannot be changed
+        (409). An empty body is a no-op and returns the key.
       security:
         - session: []
           csrf: []
@@ -383,6 +394,9 @@ paths:
             examples:
               rename:
                 value: {name: home-assistant (garage)}
+              allow_paid:
+                summary: Owner only
+                value: {allow_paid: true}
       responses:
         "200":
           description: Updated key.
@@ -403,9 +417,18 @@ paths:
                     revoked_at: null
                     last_used_at: "2026-11-02T19:30:02Z"
                     rate_limit_rpm: null
+                    allow_paid: false
         "400": {$ref: "#/components/responses/InvalidRequest"}
         "401": {$ref: "#/components/responses/Unauthorized"}
-        "403": {$ref: "#/components/responses/CsrfFailed"}
+        "403":
+          description: "`csrf_failed` - missing or invalid CSRF token or Origin; `forbidden` - a member sent `allow_paid`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+              examples:
+                member_paid:
+                  value:
+                    error: {code: forbidden, message: only the owner can change paid model access}
         "404": {$ref: "#/components/responses/NotFound"}
         "409":
           description: "`conflict` - the key is revoked."
@@ -452,6 +475,7 @@ paths:
                     revoked_at: "2026-11-02T18:00:03Z"
                     last_used_at: null
                     rate_limit_rpm: null
+                    allow_paid: false
         "401": {$ref: "#/components/responses/Unauthorized"}
         "403": {$ref: "#/components/responses/CsrfFailed"}
         "404": {$ref: "#/components/responses/NotFound"}
@@ -517,9 +541,9 @@ paths:
                     to: "2026-11-02"
                     group_by: day
                     rows:
-                      - {date: "2026-11-01", requests: 120, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 70320, avg_latency_ms: 586}
-                      - {date: "2026-11-02", requests: 85, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 47175, avg_latency_ms: 555}
-                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                      - {date: "2026-11-01", requests: 120, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 70320, avg_latency_ms: 586, cost_usd: 0}
+                      - {date: "2026-11-02", requests: 85, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 47175, avg_latency_ms: 555, cost_usd: 0}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463, cost_usd: 0}
                 by_key:
                   summary: "group_by=key (owner)"
                   value:
@@ -527,9 +551,9 @@ paths:
                     to: "2026-11-02"
                     group_by: key
                     rows:
-                      - {key_id: k7m2q4x6w3ab, key_name: home-assistant, owner_email: alice@example.com, requests: 150, errors: 3, client_errors: 3, server_errors: 0, total_latency_ms: 84000, avg_latency_ms: 560}
-                      - {key_id: p3r5t7v2z4cd, key_name: imported (SOPS), owner_email: owner@example.com, requests: 55, errors: 1, client_errors: 0, server_errors: 1, total_latency_ms: 33495, avg_latency_ms: 609}
-                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                      - {key_id: k7m2q4x6w3ab, key_name: home-assistant, owner_email: alice@example.com, requests: 150, errors: 3, client_errors: 3, server_errors: 0, total_latency_ms: 84000, avg_latency_ms: 560, cost_usd: 0}
+                      - {key_id: p3r5t7v2z4cd, key_name: imported (SOPS), owner_email: owner@example.com, requests: 55, errors: 1, client_errors: 0, server_errors: 1, total_latency_ms: 33495, avg_latency_ms: 609, cost_usd: 0}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463, cost_usd: 0}
                 by_model:
                   summary: "group_by=model"
                   value:
@@ -537,10 +561,10 @@ paths:
                     to: "2026-11-02"
                     group_by: model
                     rows:
-                      - {model: laya-english, requests: 180, errors: 1, client_errors: 0, server_errors: 1, total_latency_ms: 108000, avg_latency_ms: 600}
-                      - {model: siglip2-base-patch16-224, requests: 22, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 9420, avg_latency_ms: 428.1818}
-                      - {model: null, requests: 3, errors: 3, client_errors: 3, server_errors: 0, total_latency_ms: 75, avg_latency_ms: 25}
-                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                      - {model: laya-english, requests: 180, errors: 1, client_errors: 0, server_errors: 1, total_latency_ms: 108000, avg_latency_ms: 600, cost_usd: 0}
+                      - {model: siglip2-base-patch16-224, requests: 22, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 9420, avg_latency_ms: 428.1818, cost_usd: 0}
+                      - {model: null, requests: 3, errors: 3, client_errors: 3, server_errors: 0, total_latency_ms: 75, avg_latency_ms: 25, cost_usd: 0}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463, cost_usd: 0}
                 by_route:
                   summary: "group_by=route"
                   value:
@@ -548,10 +572,10 @@ paths:
                     to: "2026-11-02"
                     group_by: route
                     rows:
-                      - {route: /v1/decide/text, requests: 181, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 108000, avg_latency_ms: 596.6851}
-                      - {route: /v1/classify/image, requests: 22, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 9420, avg_latency_ms: 428.1818}
-                      - {route: /v1/models, requests: 2, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 75, avg_latency_ms: 37.5}
-                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463}
+                      - {route: /v1/decide/text, requests: 181, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 108000, avg_latency_ms: 596.6851, cost_usd: 0}
+                      - {route: /v1/classify/image, requests: 22, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 9420, avg_latency_ms: 428.1818, cost_usd: 0}
+                      - {route: /v1/models, requests: 2, errors: 0, client_errors: 0, server_errors: 0, total_latency_ms: 75, avg_latency_ms: 37.5, cost_usd: 0}
+                    total: {requests: 205, errors: 4, client_errors: 3, server_errors: 1, total_latency_ms: 117495, avg_latency_ms: 573.1463, cost_usd: 0}
         "400":
           description: "`invalid_request` - bad date, `from` after `to`, range over 366 days, or unknown `group_by`."
           content:
@@ -867,7 +891,7 @@ components:
       description: Free label, 1-64 characters, trimmed of surrounding whitespace.
     Key:
       type: object
-      required: [id, name, prefix, source, owner_email, status, created_at, expires_at, revoked_at, last_used_at, rate_limit_rpm]
+      required: [id, name, prefix, source, owner_email, status, created_at, expires_at, revoked_at, last_used_at, rate_limit_rpm, allow_paid]
       properties:
         id: {$ref: "#/components/schemas/KeyIdValue"}
         name: {$ref: "#/components/schemas/KeyName"}
@@ -901,6 +925,9 @@ components:
           minimum: 1
           readOnly: true
           description: Reserved for a later per-key rate limit. Always `null` now and ignored.
+        allow_paid:
+          type: boolean
+          description: May use paid (OpenRouter) models; set by the owner. Default false.
     CreatedKey:
       allOf:
         - $ref: "#/components/schemas/Key"
@@ -933,10 +960,13 @@ components:
       additionalProperties: false
       properties:
         name: {$ref: "#/components/schemas/KeyName"}
+        allow_paid:
+          type: boolean
+          description: Owner only. Let the key use paid (OpenRouter) models.
     # ---------- usage ----------
     UsageTotals:
       type: object
-      required: [requests, errors, client_errors, server_errors, total_latency_ms, avg_latency_ms]
+      required: [requests, errors, client_errors, server_errors, total_latency_ms, avg_latency_ms, cost_usd]
       properties:
         requests: {type: integer, minimum: 0}
         errors:
@@ -950,6 +980,10 @@ components:
           type: [number, "null"]
           minimum: 0
           description: "`total_latency_ms / requests`; `null` when `requests` is 0."
+        cost_usd:
+          type: number
+          minimum: 0
+          description: Sum of the upstream (OpenRouter) `usage.cost` of the requests, in USD credits; 0 for local models.
     UsageRow:
       allOf:
         - $ref: "#/components/schemas/UsageTotals"
@@ -1037,7 +1071,7 @@ components:
         at: {type: string, format: date-time}
         event:
           type: string
-          enum: [sign_in.allowed, sign_in.denied, member.invited, member.removed, key.created, key.revoked]
+          enum: [sign_in.allowed, sign_in.denied, member.invited, member.removed, key.created, key.revoked, key.paid_access_changed]
         actor_email:
           type: [string, "null"]
           description: |

@@ -80,14 +80,28 @@ def signed_out() -> str:
 # ---------------------------------------------------------------- keys
 
 
-def keys_table(keys: list[dict], *, show_owner: bool, caption: str) -> str:
+def _paid_cell(k: dict, can_toggle: bool) -> str:
+    """Paid (OpenRouter) model access: a toggle for the owner, read-only text for members."""
+    allowed = bool(k.get("allow_paid"))
+    text = "allowed" if allowed else "not allowed"
+    if not can_toggle or k["status"] == "revoked":
+        return f"<td>{text}</td>"
+    kid = e(k["id"])
+    label = "Deny paid models" if allowed else "Allow paid models"
+    return (
+        f'<td>{text} <button type="button" data-action="toggle-paid" data-paid-key="{kid}" '
+        f'data-allow="{"false" if allowed else "true"}" data-name="{e(k["name"])}">{label}</button></td>'
+    )
+
+
+def keys_table(keys: list[dict], *, show_owner: bool, caption: str, can_toggle_paid: bool = False) -> str:
     if not keys:
         return f"<p>{e(caption)}: none yet.</p>"
     head = '<th scope="col">Name</th><th scope="col">Prefix</th>'
     if show_owner:
         head += '<th scope="col">Owner</th>'
     head += ('<th scope="col">Created</th><th scope="col">Expires</th><th scope="col">Last used</th>'
-             '<th scope="col">Status</th><th scope="col">Actions</th>')  # fmt: skip
+             '<th scope="col">Status</th><th scope="col">Paid models</th><th scope="col">Actions</th>')  # fmt: skip
     rows = []
     for k in keys:
         kid = e(k["id"])
@@ -98,6 +112,7 @@ def keys_table(keys: list[dict], *, show_owner: bool, caption: str) -> str:
             f"<td>{_t(k['created_at'])}</td><td>{_t(k['expires_at'])}</td><td>{_t(k['last_used_at'])}</td>"
             f'<td><span class="status status-{e(k["status"])}">{e(k["status"])}</span></td>'
         )
+        cells += _paid_cell(k, can_toggle_paid)
         if k["status"] == "revoked":
             actions = '<span class="muted">—</span>'
         else:
@@ -188,7 +203,8 @@ def home(viewer: Viewer, csrf: str, keys: list[dict], usage: dict) -> str:
     body = (
         '<section aria-labelledby="keys-h"><h2 id="keys-h">Your keys</h2>'
         "<p>Send a key as <code>Authorization: Bearer &lt;key&gt;</code> to the <code>/v1</code> API.</p>"
-        f"{keys_table(keys, show_owner=False, caption='Your API keys')}</section>\n"
+        "<p>Paid models (OpenRouter, for example <code>jev</code>) work only with keys the owner allowed.</p>"
+        f"{keys_table(keys, show_owner=False, caption='Your API keys', can_toggle_paid=viewer.is_owner)}</section>\n"
         f"{CREATE_FORM}\n"
         '<section aria-labelledby="usage-h"><h2 id="usage-h">Usage of your keys (last 30 days)</h2>'
         f"{usage_chart(usage, 'Usage of your keys')}</section>"
@@ -208,7 +224,7 @@ def all_keys(viewer: Viewer, csrf: str, keys: list[dict], members: list[dict], s
     body = (
         f'<form method="get" action="/admin/keys" class="filter">{_user_select(members, selected, "user-filter")} '
         '<button type="submit">Filter</button></form>\n'
-        f"{keys_table(keys, show_owner=True, caption='Keys of ' + (selected or 'everyone'))}"
+        f"{keys_table(keys, show_owner=True, caption='Keys of ' + (selected or 'everyone'), can_toggle_paid=True)}"
     )
     return layout("All keys", body, viewer, csrf, current="/admin/keys")
 

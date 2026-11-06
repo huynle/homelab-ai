@@ -232,7 +232,7 @@ def create_app(
                 "no API keys configured: set DECISION_API_KEYS_FILE or DECISION_API_KEYS "
                 "(or DECISION_API_ALLOW_NO_AUTH=1 for tests only)"
             )
-        keystore = FileKeyStore(settings.api_keys)
+        keystore = FileKeyStore(settings.api_keys, allow_paid=settings.file_keys_allow_paid)
         auth_required = bool(settings.api_keys)
         if not auth_required:
             log.warning("DECISION_API_ALLOW_NO_AUTH=1: serving without authentication")

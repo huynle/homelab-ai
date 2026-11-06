@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from collections.abc import Callable
 from datetime import datetime
@@ -26,23 +27,29 @@ class UsageAggregator:
         self._now = now
         self._interval = last_used_interval_s
         self._lock = threading.Lock()
-        self._counts: dict[Key, list] = {}  # [requests, client_errors, server_errors, latency_ms_sum]
+        self._counts: dict[Key, list] = {}  # [requests, client_errors, server_errors, latency_ms_sum, cost_usd]
         self._seen: dict[str, datetime] = {}  # public_id -> latest use not yet written to last_used_at
         self._written: dict[str, datetime] = {}  # public_id -> last_used_at last written
 
-    def record(self, public_id: str, route: str, model: str | None, status: int, latency_ms: float) -> None:
+    def record(
+        self, public_id: str, route: str, model: str | None, status: int, latency_ms: float, cost_usd: float = 0.0
+    ) -> None:
+        """Count one request. ``cost_usd``: the upstream (OpenRouter) cost; non-finite or negative counts as 0."""
+        if not isinstance(cost_usd, (int, float)) or not math.isfinite(cost_usd) or cost_usd < 0:
+            cost_usd = 0.0
         at = self._now()
         key = (at.astimezone(UTC).date().isoformat(), public_id, route, model)
         with self._lock:
             c = self._counts.get(key)
             if c is None:
-                c = self._counts[key] = [0, 0, 0, 0.0]
+                c = self._counts[key] = [0, 0, 0, 0.0, 0.0]
             c[0] += 1
             if 400 <= status < 500:
                 c[1] += 1
             elif status >= 500:
                 c[2] += 1
             c[3] += latency_ms
+            c[4] += cost_usd
             if public_id not in self._seen or self._seen[public_id] < at:
                 self._seen[public_id] = at
 
@@ -53,7 +60,7 @@ class UsageAggregator:
     def _restore(self, counts: dict[Key, list], seen: dict[str, datetime]) -> None:
         with self._lock:
             for key, add in counts.items():
-                c = self._counts.setdefault(key, [0, 0, 0, 0.0])
+                c = self._counts.setdefault(key, [0, 0, 0, 0.0, 0.0])
                 for i, v in enumerate(add):
                     c[i] += v
             for public_id, at in seen.items():
@@ -78,8 +85,8 @@ class UsageAggregator:
             return True
         try:
             with self._db.write(bump=False) as conn:
-                for (day, public_id, route, model), (req, ce, se, lat) in counts.items():
-                    upsert_usage(conn, day, public_id, route, model, req, ce, se, lat)
+                for (day, public_id, route, model), (req, ce, se, lat, cost) in counts.items():
+                    upsert_usage(conn, day, public_id, route, model, req, ce, se, lat, cost)
                 for public_id, at in touch.items():
                     ts = iso(at)
                     conn.execute(

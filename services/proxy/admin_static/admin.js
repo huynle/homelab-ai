@@ -108,6 +108,18 @@
       }
       const id = button.getAttribute("data-key");
       run(api("POST", "/admin/api/keys/" + encodeURIComponent(id) + "/revoke"), () => window.location.reload());
+    } else if (action === "toggle-paid") {
+      // owner only (the server refuses members): paid OpenRouter models for this key, from its next request
+      const id = button.getAttribute("data-paid-key");
+      const allow = button.getAttribute("data-allow") === "true";
+      const name = button.getAttribute("data-name");
+      const question = allow
+        ? "Allow the key \u201c" + name + "\u201d to use paid models? Its requests then cost OpenRouter credits."
+        : "Stop the key \u201c" + name + "\u201d from using paid models?";
+      if (!window.confirm(question)) return;
+      run(api("PATCH", "/admin/api/keys/" + encodeURIComponent(id), { allow_paid: allow }), () =>
+        window.location.reload()
+      );
     } else if (action === "remove-member") {
       const email = button.getAttribute("data-email");
       const ok = window.confirm(

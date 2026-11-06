@@ -67,6 +67,7 @@ def test_success_responses_match_schemas(admin, validate, laya_request):
     validate(owner.get("/admin/api/keys").json(), "KeyList")
     validate(alice.get("/admin/api/keys").json(), "KeyList")
     validate(admin.call(alice, "PATCH", f"/admin/api/keys/{key['id']}", {"name": "ha2"}).json(), "Key")
+    validate(admin.call(owner, "PATCH", f"/admin/api/keys/{key['id']}", {"allow_paid": True}).json(), "Key")
 
     api = admin.client()
     auth = {"Authorization": f"Bearer {key['key']}"}
@@ -83,6 +84,7 @@ def test_success_responses_match_schemas(admin, validate, laya_request):
             dims = {"day": {"date"}, "key": {"key_id", "key_name", "owner_email"}, "model": {"model"},
                     "route": {"route"}}[group_by]  # fmt: skip
             totals = {"requests", "errors", "client_errors", "server_errors", "total_latency_ms", "avg_latency_ms"}
+            totals.add("cost_usd")
             assert all(set(r) == dims | totals for r in report.json()["rows"])
 
     validate(owner.get("/admin/api/members").json(), "MemberList")
@@ -94,6 +96,7 @@ def test_success_responses_match_schemas(admin, validate, laya_request):
     validate(page, "AuditPage")
     events = {e["event"] for e in page["entries"]}
     assert {"sign_in.allowed", "member.invited", "member.removed", "key.created", "key.revoked"} <= events
+    assert "key.paid_access_changed" in events
     admin.sign_in(admin.client(), "mallory@example.com")
     validate(owner.get("/admin/api/audit").json(), "AuditPage")
 
