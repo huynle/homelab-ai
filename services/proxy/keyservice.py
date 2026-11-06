@@ -109,7 +109,7 @@ def _expiry(expires_at: datetime | str | None, now: datetime) -> str | None:
         return None
     if isinstance(expires_at, str):
         try:
-            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))  # noqa: FURB162 (3.10)
         except ValueError:
             raise ServiceError("invalid_request", "expires_at: must be an RFC 3339 date-time") from None
     if not isinstance(expires_at, datetime) or expires_at.tzinfo is None:

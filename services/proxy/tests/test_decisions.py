@@ -382,7 +382,7 @@ def test_conversation_is_rendered_as_a_transcript(client, auth, echo):
     }
     resp = post(client, auth, body)
     assert resp.status_code == 200, resp.text
-    assert predict_calls(echo)[0]["state"] == "\n".join(
+    assert predict_calls(echo)[0]["state"] == "\n".join(  # noqa: FLY002 (one line per transcript entry)
         [
             "developer: You route tickets.",
             'user: Refund order 7\n{"order":7}',

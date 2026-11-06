@@ -220,8 +220,9 @@ def _alpha_op(spec):
 
 @pytest.fixture
 def alpha_client(tmp_path, backends):
-    from orkit import FakeOpenRouter, write_key, write_registry
     from test_decisions import laya_echo
+
+    from orkit import FakeOpenRouter, write_key, write_registry
 
     backends.text = laya_echo
     fake = FakeOpenRouter()
@@ -251,7 +252,7 @@ def test_alpha_spec_examples_validate_and_are_accepted(spec, validate, alpha_cli
         validate(ex["value"], "AlphaDecisionsResponse")
     for status, response in op["responses"].items():
         if status != "200":
-            ref = response["$ref"] if "$ref" in response else None
+            ref = response.get("$ref")
             body = spec["components"]["responses"][ref.rsplit("/", 1)[1]] if ref else response
             for ex in body["content"]["application/json"].get("examples", {}).values():
                 validate(ex["value"], "AlphaErrorEnvelope")

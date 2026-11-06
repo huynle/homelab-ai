@@ -94,7 +94,7 @@ class UsageAggregator:
                         " WHERE public_id = ? AND (last_used_at IS NULL OR last_used_at < ?)",
                         (ts, public_id, ts),
                     )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 (keep the counts whatever failed)
             log.warning("usage flush failed (%s: %s); keeping the counts for the next flush", type(exc).__name__, exc)
             self._restore(counts, touch)
             return False

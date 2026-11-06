@@ -264,7 +264,7 @@ def create_app(
             await asyncio.sleep(interval)
             try:
                 await probe_backends(http)
-            except Exception as exc:  # never let the probe loop die
+            except Exception as exc:  # noqa: BLE001 (never let the probe loop die)
                 log.warning("periodic backend probe failed (%s)", type(exc).__name__)
 
     def start_metrics_server():
@@ -273,7 +273,7 @@ def create_app(
         host = settings.metrics_host or settings.host
         try:
             server = metrics.start_metrics_server(host=host, port=settings.metrics_port, registry=mx.registry)
-        except Exception as exc:  # metrics are best effort: the API keeps serving without them
+        except Exception as exc:  # noqa: BLE001 (metrics are best effort: the API keeps serving without them)
             log.error("metrics server not started on %s:%s (%s)", host, settings.metrics_port, exc)
             return None
         log.info("metrics on http://%s:%s/metrics", host, settings.metrics_port)
@@ -344,7 +344,7 @@ def create_app(
                     response = await call_next(request)
             else:
                 response = await call_next(request)
-        except Exception as exc:  # never leak internals to the client
+        except Exception as exc:  # noqa: BLE001 (never leak internals to the client)
             log.error("unhandled %s on %s %s", type(exc).__name__, request.method, admin_mod.log_path(path))
             if admin_path and admin is not None:
                 response = admin_mod.error_json("internal_error", "unexpected error")
