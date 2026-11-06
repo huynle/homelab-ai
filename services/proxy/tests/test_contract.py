@@ -199,3 +199,125 @@ def test_schema_rejects_what_the_proxy_rejects(validate):
         validate(
             {"input": bad_image, "questions": [{"type": "predicate", "instructions": "?"}]}, "DecisionCreateRequest"
         )
+
+
+# ---------------------------------------------------------------- /api/alpha/decisions (OpenRouter wire format)
+
+ALPHA = "/api/alpha/decisions"
+
+
+def test_contract_version_and_error_codes(spec):
+    import errors
+
+    assert spec["info"]["version"] == "1.5.0"
+    assert set(spec["components"]["schemas"]["Error"]["properties"]["code"]["enum"]) == set(errors.STATUS)
+    assert set(spec["components"]["schemas"]["AlphaErrorMetadata"]["properties"]["code"]["enum"]) == set(errors.STATUS)
+
+
+def _alpha_op(spec):
+    return spec["paths"][ALPHA]["post"]
+
+
+@pytest.fixture
+def alpha_client(tmp_path, backends):
+    from orkit import FakeOpenRouter, write_key, write_registry
+    from test_decisions import laya_echo
+
+    backends.text = laya_echo
+    fake = FakeOpenRouter()
+    settings = Settings(
+        api_keys=(API_KEY,),
+        text_backend_url="http://text-backend.test:8000",
+        image_backend_url="http://image-backend.test:8001",
+        registry_file=write_registry(tmp_path),
+        openrouter_key_file=write_key(tmp_path),
+        file_keys_allow_paid=True,
+    )
+    app = create_app(settings, transport=httpx.MockTransport(fake.wrap(backends.handler)))
+    with TestClient(app, raise_server_exceptions=False) as c:
+        c.fake = fake
+        yield c
+
+
+def test_alpha_spec_examples_validate_and_are_accepted(spec, validate, alpha_client):
+    op = _alpha_op(spec)
+    assert op["security"] == [{"apiKey": []}]
+    for name, ex in op["requestBody"]["content"]["application/json"]["examples"].items():
+        validate(ex["value"], "AlphaDecisionsRequest")
+        resp = alpha_client.post(ALPHA, json=ex["value"], headers={"Authorization": f"Bearer {API_KEY}"})
+        assert resp.status_code == 200, (name, resp.text)
+        validate(resp.json(), "AlphaDecisionsResponse")
+    for ex in op["responses"]["200"]["content"]["application/json"]["examples"].values():
+        validate(ex["value"], "AlphaDecisionsResponse")
+    for status, response in op["responses"].items():
+        if status != "200":
+            ref = response["$ref"] if "$ref" in response else None
+            body = spec["components"]["responses"][ref.rsplit("/", 1)[1]] if ref else response
+            for ex in body["content"]["application/json"].get("examples", {}).values():
+                validate(ex["value"], "AlphaErrorEnvelope")
+
+
+def test_alpha_real_responses_match_schema(validate, alpha_client, backends):
+    auth = {"Authorization": f"Bearer {API_KEY}"}
+    questions = {
+        "a": {"type": "noul", "instructions": "?", "criteria": {"true": "yes", "false": None}},
+        "b": {"type": "choice", "criteria": {"x": None, "y": {"d": 1}}},
+        "c": {"type": "score", "criteria": ["low", ["mid"], {"h": "high"}]},
+    }
+    for model in ("laya-english", "jev"):
+        body = {"model": model, "state": {"t": "hi"}, "questions": questions}
+        validate(body, "AlphaDecisionsRequest")
+        resp = alpha_client.post(ALPHA, json=body, headers=auth)
+        assert resp.status_code == 200, resp.text
+        validate(resp.json(), "AlphaDecisionsResponse")
+    backends.text = lambda req: httpx.Response(200, json={"answers": {}})
+    resp = alpha_client.post(ALPHA, json={"model": "laya-english", "state": "x", "questions": questions}, headers=auth)
+    validate(resp.json(), "AlphaDecisionsResponse")
+    alpha_client.fake.reply = lambda req: httpx.Response(
+        200,
+        json={
+            "answers": {
+                "w": {"type": "box", "box": {"top": 0.1, "bottom": 0.5, "left": 0.2, "right": 0.6}, "confidence": 0.9}
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 1, "cost": 0.001},
+        },
+    )
+    box = {"model": "auto", "state": "x", "questions": {"w": {"type": "box", "instructions": "the can"}}}
+    validate(box, "AlphaDecisionsRequest")
+    resp = alpha_client.post(ALPHA, json=box, headers=auth)
+    assert resp.status_code == 200
+    validate(resp.json(), "AlphaDecisionsResponse")
+
+
+def test_alpha_errors_match_schema(validate, alpha_client):
+    auth = {"Authorization": f"Bearer {API_KEY}"}
+    responses = [
+        alpha_client.post(ALPHA, json={"model": "jev"}),
+        alpha_client.post(ALPHA, json={"model": "x", "state": "s", "questions": {"q": {"type": "noul"}}}, headers=auth),
+        alpha_client.post(ALPHA, json={"model": "jev", "state": "s", "questions": {}}, headers=auth),
+    ]
+    alpha_client.fake.reply = lambda req: httpx.Response(429)
+    responses.append(
+        alpha_client.post(
+            ALPHA, json={"model": "jev", "state": "s", "questions": {"q": {"type": "noul"}}}, headers=auth
+        )
+    )
+    for resp in responses:
+        assert resp.status_code >= 400
+        validate(resp.json(), "AlphaErrorEnvelope")
+
+
+def test_alpha_schema_rejects_what_the_proxy_rejects(validate):
+    ok = {"model": "jev", "state": "x", "questions": {"q": {"type": "noul"}}}
+    validate(ok, "AlphaDecisionsRequest")
+    for bad in (
+        {k: v for k, v in ok.items() if k != "model"},
+        dict(ok, stream=True),
+        dict(ok, questions={}),
+        dict(ok, questions={"bad id": {"type": "noul"}}),
+        dict(ok, questions={"q": {"type": "box"}}),
+        dict(ok, questions={"q": {"type": "noul", "criteria": {"maybe": "x"}}}),
+        dict(ok, assets={"a": {"format": "gif", "data_base64": "AAAA"}}),
+    ):
+        with pytest.raises(AssertionError):
+            validate(bad, "AlphaDecisionsRequest")
