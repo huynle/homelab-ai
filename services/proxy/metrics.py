@@ -80,6 +80,12 @@ class Metrics:
             ("model",),
             registry=reg,
         )
+        self.upstream_cost = Counter(
+            f"{PREFIX}_upstream_cost_usd",
+            "Upstream (OpenRouter) cost of served requests, from the response's usage.cost, in USD credits",
+            ("model",),
+            registry=reg,
+        )
         self.backend_up = Gauge(
             f"{PREFIX}_backend_up",
             "1 when the model's backend answered its last health probe, else 0",
@@ -112,6 +118,9 @@ class Metrics:
 
     def observe_image_ignored(self, model: str) -> None:
         self.decision_images_ignored.labels(model=model).inc()
+
+    def observe_cost(self, model: str, cost_usd: float) -> None:
+        self.upstream_cost.labels(model=model).inc(cost_usd)
 
     def set_backend_up(self, model: str, up: bool) -> None:
         self.backend_up.labels(model=model).set(1 if up else 0)

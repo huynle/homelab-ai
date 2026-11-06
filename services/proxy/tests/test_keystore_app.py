@@ -175,7 +175,7 @@ def test_sqlite_mode_imports_sops_key_keeping_hash_key_id(sqlite_app, sqlite_set
     caplog.set_level(logging.INFO, logger="decision_api.access")
     with TestClient(sqlite_app) as c:
         assert c.get("/v1/models", headers={"Authorization": f"Bearer {API_KEY}"}).status_code == 200
-    entry = json.loads([r for r in caplog.records if r.name == "decision_api.access"][0].getMessage())
+    entry = json.loads(next(r for r in caplog.records if r.name == "decision_api.access").getMessage())
     assert entry["key_id"] == keystore.legacy_key_id(API_KEY)
     assert _usage_rows(db) == [(key["id"], "/v1/models", "", 1, 0, 0)]
     # restart: no duplicate import

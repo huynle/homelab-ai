@@ -387,15 +387,22 @@ def install(app: FastAPI, admin: Admin) -> None:
         return JSONResponse(created, status_code=201, headers={"Location": f"/admin/api/keys/{created['id']}"})
 
     @app.patch("/admin/api/keys/{id}")
-    async def update_key(request: Request, id: str):  # noqa: A002 (the contract's parameter name)
+    async def update_key(request: Request, id: str):
         v = admin.api_session(request, unsafe=True).viewer
-        data = await admin.body(request, {"name"})
+        data = await admin.body(request, {"name", "allow_paid"})
         if "name" in data and data["name"] is None:
             raise AdminError("invalid_request", f"name: must be 1 to {ks.MAX_NAME} characters")
-        return ks.rename_key(admin.db, v, id, data.get("name"), now=now())
+        if "allow_paid" in data and not v.is_owner:
+            raise AdminError("forbidden", "only the owner can change paid model access")
+        if "allow_paid" in data and not isinstance(data["allow_paid"], bool):
+            raise AdminError("invalid_request", "allow_paid: must be true or false")
+        key = ks.rename_key(admin.db, v, id, data.get("name"), now=now())
+        if "allow_paid" in data:
+            key = ks.set_paid_access(admin.db, v, id, data["allow_paid"], now=now())
+        return key
 
     @app.post("/admin/api/keys/{id}/revoke")
-    async def revoke_key(request: Request, id: str):  # noqa: A002
+    async def revoke_key(request: Request, id: str):
         v = admin.api_session(request, unsafe=True).viewer
         await admin.body(request, set(), required=False)
         return ks.revoke_key(admin.db, v, id, now=now())

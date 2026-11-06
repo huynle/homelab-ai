@@ -7,5 +7,5 @@ extend-select = ["I", "B", "UP"]
 [lint.isort]
 known-first-party = [
     "adapters", "app", "config", "db", "errors", "keyservice", "keystore", "metrics", "models", "registry",
-    "usage", "conftest", "oidc", "fakegoogle", "admin", "admin_pages", "sessions", "adminkit",
+    "usage", "conftest", "oidc", "fakegoogle", "admin", "admin_pages", "sessions", "adminkit", "orkit", "openrouter_decisions",
 ]

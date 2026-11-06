@@ -15,6 +15,7 @@ DEFAULT_LAYA_VERSION = "laya-serve-0.4.20"
 DEFAULT_IMAGE_MODEL_ID = "siglip2-base-patch16-224"
 DEFAULT_IMAGE_MODEL_VERSION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
 DEFAULT_LAYA_CHECKPOINTS = ("english", "multilingual", "typed-decisions")
+DEFAULT_OPENROUTER_REFERER = "https://decide.ai.huynle.com"
 
 TRUTHY = {"1", "true", "yes", "on"}
 KEYSTORES = ("file", "sqlite")
@@ -51,6 +52,10 @@ class Settings:
     oauth_client_secret_file: str | None = None
     public_url: str | None = None
     session_key_file: str | None = None
+    # OpenRouter (registry entries with adapter: openrouter, served by POST /api/alpha/decisions).
+    openrouter_key_file: str | None = None
+    openrouter_referer: str = DEFAULT_OPENROUTER_REFERER  # sent as HTTP-Referer (OpenRouter app attribution)
+    file_keys_allow_paid: bool = False  # KEYSTORE=file keys may use paid models (dev/tests only)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -92,7 +97,24 @@ class Settings:
             oauth_client_secret_file=get("DECISION_API_OAUTH_CLIENT_SECRET_FILE", d.oauth_client_secret_file),
             public_url=get("DECISION_API_PUBLIC_URL", d.public_url),
             session_key_file=get("DECISION_API_SESSION_KEY_FILE", d.session_key_file),
+            openrouter_key_file=get("DECISION_API_OPENROUTER_KEY_FILE", d.openrouter_key_file),
+            openrouter_referer=get("DECISION_API_OPENROUTER_REFERER", d.openrouter_referer),
+            file_keys_allow_paid=get("DECISION_API_FILE_KEYS_ALLOW_PAID", "0").lower() in TRUTHY,
         )
+
+
+def read_openrouter_key(path: str | None) -> str | None:
+    """The OpenRouter API key from DECISION_API_OPENROUTER_KEY_FILE (stripped); None when the variable is unset."""
+    if not path:
+        return None
+    try:
+        key = Path(path).read_text().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) else "not UTF-8 text"
+        raise RuntimeError(f"DECISION_API_OPENROUTER_KEY_FILE {path!r} is not readable ({reason})") from None
+    if not key:
+        raise RuntimeError(f"DECISION_API_OPENROUTER_KEY_FILE {path!r} is empty")
+    return key
 
 
 def parse_emails(value: str) -> tuple[str, ...]:

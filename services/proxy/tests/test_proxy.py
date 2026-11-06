@@ -66,7 +66,7 @@ def test_client_authorization_is_not_forwarded(client, auth, laya_request, image
     client.post(IMAGE, json=image_request, headers=auth)
     assert len(backends.requests) == 2
     for req in backends.requests:
-        assert "authorization" not in {k.lower() for k in req.headers.keys()}
+        assert "authorization" not in {k.lower() for k in req.headers}
         assert API_KEY not in req.content.decode()
 
 
@@ -369,27 +369,43 @@ def test_health_down_is_503(client, backends):
 
 def test_health_does_not_forward_authorization(client, auth, backends):
     client.get("/v1/health", headers=auth)
-    assert all("authorization" not in {k.lower() for k in r.headers.keys()} for r in backends.requests)
+    assert all("authorization" not in {k.lower() for k in r.headers} for r in backends.requests)
 
 
 # ---------------------------------------------------------------- models
 
 
 def test_models_lists_contract_models(client, auth):
+    TEXT = {"capabilities": ["text"], "paid": False}
+    IMAGE = {"capabilities": ["image"], "paid": False}
     resp = client.get("/v1/models", headers=auth)
     assert resp.status_code == 200
     assert resp.json() == {
         "models": [
-            {"id": "laya-english", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
-            {"id": "laya-multilingual", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
-            {"id": "laya-typed-decisions", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
+            {"id": "laya-english", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20", **TEXT},
+            {
+                "id": "laya-multilingual",
+                "task": "text-decision",
+                "backend": "laya",
+                "version": "laya-serve-0.4.20",
+                **TEXT,
+            },
+            {
+                "id": "laya-typed-decisions",
+                "task": "text-decision",
+                "backend": "laya",
+                "version": "laya-serve-0.4.20",
+                **TEXT,
+            },
             {
                 "id": "siglip2-base-patch16-224",
                 "task": "image-zero-shot",
                 "backend": "siglip2",
                 "version": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+                **IMAGE,
             },
-        ]
+        ],
+        "aliases": [],
     }
 
 
@@ -416,7 +432,7 @@ def test_access_log_has_key_id_but_no_secrets(client, auth, laya_request, caplog
 def test_access_log_for_unauthenticated_request(client, caplog):
     caplog.set_level(logging.INFO, logger="decision_api.access")
     client.get("/v1/models", headers={"Authorization": "Bearer wrong-key-value"})
-    entry = json.loads([r for r in caplog.records if r.name == "decision_api.access"][0].getMessage())
+    entry = json.loads(next(r for r in caplog.records if r.name == "decision_api.access").getMessage())
     assert entry["status"] == 401
     assert entry["key_id"] is None
     assert "wrong-key-value" not in caplog.text

@@ -268,7 +268,7 @@ def test_real_metrics_server_serves_registry(client, auth, laya_request):
     server = REAL_START(host="127.0.0.1", port=0, registry=client.app.state.metrics.registry)
     try:
         port = server.server_port
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:  # noqa: S310
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:
             body = resp.read().decode()
     finally:
         server.shutdown()

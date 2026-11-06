@@ -47,20 +47,20 @@ def write_secret(path: Path, data: bytes) -> str:
 
 
 def admin_settings(tmp_path: Path, **overrides) -> Settings:
-    base = dict(
-        api_keys=(API_KEY,),
-        text_backend_url=TEXT_URL,
-        image_backend_url=IMAGE_URL,
-        keystore="sqlite",
-        db_path=str(tmp_path / "decision-api.db"),
-        pepper_file=write_secret(tmp_path / "pepper", PEPPER),
-        owner_emails=("owner@example.com",),
-        usage_flush_s=3600,
-        oauth_client_id=CLIENT_ID,
-        oauth_client_secret_file=write_secret(tmp_path / "oauth-secret", CLIENT_SECRET.encode()),
-        public_url=PUBLIC_URL,
-        session_key_file=write_secret(tmp_path / "session-key", SESSION_KEY),
-    )
+    base = {
+        "api_keys": (API_KEY,),
+        "text_backend_url": TEXT_URL,
+        "image_backend_url": IMAGE_URL,
+        "keystore": "sqlite",
+        "db_path": str(tmp_path / "decision-api.db"),
+        "pepper_file": write_secret(tmp_path / "pepper", PEPPER),
+        "owner_emails": ("owner@example.com",),
+        "usage_flush_s": 3600,
+        "oauth_client_id": CLIENT_ID,
+        "oauth_client_secret_file": write_secret(tmp_path / "oauth-secret", CLIENT_SECRET.encode()),
+        "public_url": PUBLIC_URL,
+        "session_key_file": write_secret(tmp_path / "session-key", SESSION_KEY),
+    }
     base.update(overrides)
     return Settings(**base)
 

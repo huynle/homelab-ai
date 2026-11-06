@@ -328,6 +328,7 @@ def test_usage_owner_by_day_totals(usage_db):
             "server_errors": 1,
             "total_latency_ms": 1075.0,
             "avg_latency_ms": round(1075 / 13, 4),
+            "cost_usd": 0.0,
         },
         {
             "date": "2026-11-02",
@@ -337,6 +338,7 @@ def test_usage_owner_by_day_totals(usage_db):
             "server_errors": 2,
             "total_latency_ms": 1050.0,
             "avg_latency_ms": 70.0,
+            "cost_usd": 0.0,
         },
     ]
     assert r["total"] == {
@@ -346,6 +348,7 @@ def test_usage_owner_by_day_totals(usage_db):
         "server_errors": 3,
         "total_latency_ms": 2125.0,
         "avg_latency_ms": round(2125 / 28, 4),
+        "cost_usd": 0.0,
     }
 
 
@@ -367,6 +370,7 @@ def test_usage_group_by_key_model_route(usage_db):
     assert set(by_model[0]) == {"model", "requests", "errors", "client_errors", "server_errors"} | {
         "total_latency_ms",
         "avg_latency_ms",
+        "cost_usd",
     }
     by_route = ks.usage_query(db, o, from_="2026-11-01", to="2026-11-02", group_by="route", today=TODAY)["rows"]
     assert [(r["route"], r["requests"]) for r in by_route] == [

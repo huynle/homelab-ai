@@ -8,8 +8,9 @@ model backends listed in its [backend registry](#backend-registry):
 | `POST /v1/decide/text` | `text-decision` model, Laya adapter: `POST {backend_url}/predict` |
 | `POST /v1/classify/image` | `image-zero-shot` model, zero-shot-image adapter: `POST {backend_url}/classify` |
 | `POST /v1/decisions` | OpenAI Decisions format, translated by `decisions.py` onto the Laya adapter (one call per 32 questions) or, for an image with no text or JSON evidence and only choice questions, the zero-shot-image adapter (one call per question); an image that comes with text is ignored (`X-Decision-Image: ignored`) |
-| `GET /v1/health` | `GET {backend_url}/health` once per distinct backend (public, no auth) |
-| `GET /v1/models` | the registry entries |
+| `POST /api/alpha/decisions` | OpenRouter Decisions format (`openrouter_decisions.py`): forwarded unchanged to OpenRouter for paid `openrouter` models (allowed keys only), or translated onto the Laya adapter (one call per 32 questions) or the zero-shot-image adapter (one image, choice questions) |
+| `GET /v1/health` | `GET {backend_url}/health` once per distinct local backend (public, no auth); OpenRouter models are listed under `upstreams`, never probed |
+| `GET /v1/models` | the registry entries (with `capabilities`, `paid`) and `aliases` |
 | `GET /healthz` | none: process liveness for Kubernetes (public, no auth, not access-logged) |
 | `/admin`, `/admin/api/*`, `/admin/auth/*` | the [admin page](#admin-page) (off by default; 404 unless enabled) |
 
@@ -28,8 +29,8 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 
 - `app.py`: `create_app()` (routes, auth, body limits, model resolution, health, access log) and `main()`
 - `registry.py`: the backend registry (YAML schema, validation, env fallback, model resolution)
-- `adapters.py`: one class per backend type (`laya`, `zero-shot-image`): backend call, response mapping
-  and backend error mapping
+- `adapters.py`: one class per backend type (`laya`, `zero-shot-image`, `openrouter`): backend call,
+  response mapping and backend error mapping
 - `config.py`: `Settings.from_env()` and API key loading
 - `keystore.py`: the key stores (`FileKeyStore`, `SqliteKeyStore`), key format, HMAC hashing; see
   [Key store](#key-store)
@@ -48,6 +49,9 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 - `Dockerfile`: container image (non-root, listens on `0.0.0.0:8080`)
 - `decisions.py`: `POST /v1/decisions` (OpenAI Decisions wire format): request validation with OpenAI-style
   `param` paths, input rendering (text, JSON, transcripts), Laya and SigLIP2 payloads, and answer mapping
+- `openrouter_decisions.py`: `POST /api/alpha/decisions` (OpenRouter Decisions wire format): request
+  validation, what a request needs (media, box, text), capability checks, Laya and SigLIP2 payloads, answer
+  mapping, the body forwarded to OpenRouter and OpenRouter's error envelope
 - `models.py`: Pydantic request models and limits that mirror the spec's component schemas
 - `errors.py`: the `ApiError` code -> HTTP status table and the `ErrorEnvelope` response
 - `tests/`: pytest suite. Backends are mocked with `httpx.MockTransport` using the real captures in
@@ -80,6 +84,9 @@ keys (SOPS Secret `decision-api-keys`) live there too; a change to either needs
 | `DECISION_API_OAUTH_CLIENT_SECRET_FILE` | unset | Admin page: file with the Google OAuth client secret |
 | `DECISION_API_PUBLIC_URL` | unset | Admin page: the public https origin, `https://decide.ai.huynle.com`; the redirect URI is this plus `/admin/auth/callback` |
 | `DECISION_API_SESSION_KEY_FILE` | unset | Admin page: file with the session key (at least 32 bytes, not the pepper); signs the login cookie and derives CSRF tokens |
+| `DECISION_API_OPENROUTER_KEY_FILE` | unset | File with the OpenRouter API key (whitespace stripped) for registry entries with `adapter: openrouter`. Unreadable or empty: refuse to start. Unset while the registry has OpenRouter models: a startup warning, and those models answer 503 `backend_unavailable` |
+| `DECISION_API_OPENROUTER_REFERER` | `https://decide.ai.huynle.com` | Sent as `HTTP-Referer` on OpenRouter calls (with `X-Title: Homelab Decision API`), for OpenRouter's app attribution |
+| `DECISION_API_FILE_KEYS_ALLOW_PAID` | `0` | `1` lets every `KEYSTORE=file` key use paid (OpenRouter) models. File keys are denied by default. **Dev and tests only**; in SQLite mode the owner grants paid access per key |
 
 Used only when `DECISION_API_REGISTRY_FILE` is unset (the pre-registry setup, still the default):
 
@@ -119,11 +126,28 @@ models:
     backend: siglip2               # optional label for /v1/models; defaults to the adapter key
     backend_url: http://10.1.10.10:8010
     version: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+  - id: jev                        # a paid OpenRouter model: POST /api/alpha/decisions only
+    task: decisions
+    adapter: openrouter
+    backend_url: https://openrouter.ai/api   # must be https; POST {backend_url}/alpha/decisions
+    backend_model: typesafe/jev-1.14         # required: the OpenRouter model id
+    capabilities: [text, image, box]         # required for openrouter: text, image, box, audio, video
+    version: jev-1.14
+    timeout_s: 60
+aliases:                           # optional; names for POST /api/alpha/decisions only
+  auto: {text: laya-english, image: jev}     # image: media parts, assets or box questions
+  fast: laya-english                         # always this model
 ```
 
 Startup validation (any failure stops the proxy): ids are unique and match `[A-Za-z0-9_.-]{1,128}`,
 adapters are known and serve the entry's `task`, `backend_url` is an `http(s)` URL without a query string,
-`timeout_s` is in (0, 600], unknown keys are rejected, and both `defaults` exist and match their task.
+`timeout_s` is in (0, 600], unknown keys are rejected, and both `defaults` exist and match their task
+(so an OpenRouter model can never be a default). `capabilities` are fixed for local adapters (`laya`: text;
+`zero-shot-image`: image) and must not be set on them; `openrouter` entries need `capabilities`,
+`backend_model` and an `https` `backend_url`. An alias name must not be a model id, and its targets must be
+model ids (not other aliases). An entry is **paid** when its adapter is `openrouter`: only keys with paid
+access may use it, it is never probed by `/v1/health` (OpenRouter has no health endpoint) and it does not
+change the health `status`.
 
 Routing:
 
@@ -137,6 +161,18 @@ Routing:
   script/language, and the response reports `laya-<routing.model>` when that entry exists on the same
   backend.
 - The image request's `model` is not forwarded to the image backend.
+- `/v1/decide/text`, `/v1/classify/image` and `/v1/decisions` never reach `decisions` (OpenRouter) entries or
+  aliases: those names are 400 there.
+- `POST /api/alpha/decisions` needs `model`: a registry id of any task, an alias, or a Laya checkpoint name.
+  A two-target alias picks `image` for requests with `image_url`/`input_audio`/`video_url` parts, `assets`
+  or box questions, else `text`. Laya is always pinned (`backend_model` forwarded). The resolved model
+  must have every capability the request needs (400 otherwise), then a paid model needs a key with paid
+  access (403 `forbidden` otherwise) and a configured OpenRouter key (503 otherwise), all before any
+  backend call. OpenRouter gets `state`, `questions`, `assets` and `provider` unchanged with
+  `model: <backend_model>`, `Authorization: Bearer <OpenRouter key>`, `HTTP-Referer` and `X-Title`;
+  `session_id`, `trace` and `user` are dropped. The OpenRouter key is never logged or returned, and the
+  client's `Authorization` header is never forwarded. See [`api/README.md`](../../api/README.md#openrouter-decisions-api)
+  for the translation rules for local models.
 
 ### Adding a model
 
@@ -199,8 +235,14 @@ revokes their active keys and deletes their sessions in one transaction; members
 and usage (another user's key is `not_found`, another `user` filter is `forbidden`); usage ranges are UTC
 dates, both inclusive, default the last 30 days, at most 366 days.
 
+**Paid access.** `api_keys.allow_paid` (default 0) lets a key use paid (OpenRouter) models. Only the owner
+changes it, in the admin page or with `PATCH /admin/api/keys/{id}` `{"allow_paid": true}` (audited as
+`key.paid_access_changed`). The change bumps the key cache like a revoke, so it applies on the next request.
+File keys (`KEYSTORE=file`) are denied unless `DECISION_API_FILE_KEYS_ALLOW_PAID=1`.
+
 **Usage.** For requests that presented a valid key, the proxy adds one count per (UTC day, key, route
-template, model) in memory: requests, client errors (4xx), server errors (5xx) and total latency. The
+template, model) in memory: requests, client errors (4xx), server errors (5xx), total latency and upstream
+cost (`cost_usd_sum`: OpenRouter's `usage.cost`, when finite and >= 0). The
 counts go to `usage_daily` every `DECISION_API_USAGE_FLUSH_S` seconds and on shutdown; a failed flush keeps
 its counts for the next one. `last_used_at` is written by the same flush, at most once a minute per key.
 Requests without a resolved model are stored with model `''` and reported as `null`. In file mode no usage
@@ -209,7 +251,8 @@ is recorded (the Prometheus metrics are unchanged in both modes).
 **Logs and metrics.** `key_id` in the access log and the `key_id` metric label is the public id for issued
 keys and the 8-hex sha256 prefix for file and imported keys, as before.
 
-**Schema** (`migrations/0001_initial.sql`): `users` (email, role `owner|member`, invited by/at, removed at,
+**Schema** (`migrations/0001_initial.sql`, plus `0002_paid_access_and_cost.sql`: `api_keys.allow_paid` and
+`usage_daily.cost_usd_sum`): `users` (email, role `owner|member`, invited by/at, removed at,
 last sign-in), `api_keys` (public id, unique key HMAC, name, owner, source `issued|imported`, prefix,
 created/expires/revoked/last-used times, reserved `rate_limit_rpm`), `usage_daily` (primary key day, key,
 route, model), `sessions` (hashed id and CSRF token, expiry) and `audit` (time, actor, event, target, key
@@ -400,7 +443,9 @@ The key file must be readable by uid 10001 inside the container (in Kubernetes, 
   - An image over 8 MiB decoded (or more than 11,184,812 base64 characters) returns 413.
   - More than 32 questions or more than 64 labels returns 400.
   - Schema violations and invalid base64 return 400.
-- **Errors.** Every error uses `{"error": {"code", "message"}}` and includes `latency_ms`:
+- **Errors.** Every error uses `{"error": {"code", "message"}}` and includes `latency_ms` (except on
+  `/api/alpha/*`, which uses OpenRouter's `{"error": {"code": <status>, "message", "metadata": {"code",
+  "param"}}}`, including for 401 and 413):
 
   | Failure | Response |
   |---|---|
@@ -409,7 +454,8 @@ The key file must be readable by uid 10001 inside the container (in Kubernetes, 
   | Backend 4xx | 400 `invalid_request`, carrying the backend's message |
   | Backend 5xx or unparseable reply | 502 `backend_error` |
   | Anything else | 500 `internal_error` (no details) |
-- **Health.** Each distinct `backend_url` is probed once. `ok` when every backend answers `/health` with 200,
+- **Health.** Each distinct local `backend_url` is probed once (OpenRouter entries are not probed; they appear
+  under `upstreams` as `{"status": "not_probed", "configured": <OpenRouter key set>}` and never change `status`). `ok` when every backend answers `/health` with 200,
   `degraded` when some do (still HTTP 200), `down` when none does (HTTP 503). `backends.text` and
   `backends.image` report the default models' backends; `models` reports every model by id.
 - **Liveness.** `GET /healthz` returns `{"status": "ok"}` without auth or backend calls, and is not written
@@ -437,12 +483,14 @@ The proxy runs as a single uvicorn process, so no multiprocess mode is used.
 | `decision_api_backend_request_duration_seconds` | histogram | `model` |
 | `decision_api_backend_errors_total` | counter | `model`, `error_code` |
 | `decision_api_decision_images_ignored_total` | counter | `model` (`POST /v1/decisions` requests whose image was ignored because text or JSON came with it) |
-| `decision_api_backend_up` | gauge | `model` |
+| `decision_api_upstream_cost_usd_total` | counter | `model` (OpenRouter's `usage.cost` of served paid requests, in USD credits) |
+| `decision_api_backend_up` | gauge | `model` (local models only) |
 | `decision_api_build_info` | gauge (always 1) | `version`, `registry_models` |
 
 Labels:
 
-- `route`: the route template (`/v1/decide/text`, `/v1/classify/image`, `/v1/decisions`, `/v1/health`, `/v1/models`).
+- `route`: the route template (`/v1/decide/text`, `/v1/classify/image`, `/v1/decisions`, `/api/alpha/decisions`,
+  `/v1/health`, `/v1/models`).
   Any other path is `other`, so scanners cannot create new series. With the admin page on, every `/admin`
   path is the single value `admin` (with `key_id="none"`: bearer keys are never checked there).
 - `model`: the registry id that served the request (for Laya without `model`, the checkpoint it routed to),

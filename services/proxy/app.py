@@ -21,15 +21,18 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import admin as admin_mod
 import decisions
 import metrics
 import oidc
-from adapters import ADAPTERS, Call, Result
-from config import Settings
+import openrouter_decisions as alpha
+from adapters import ADAPTERS, Call, Result, Upstream
+from config import Settings, read_openrouter_key
 from db import utcnow
 from errors import ApiError, error_response
 from keystore import FileKeyStore, KeyStore, SqliteKeyStore, bearer_token, legacy_key_id
@@ -232,18 +235,27 @@ def create_app(
                 "no API keys configured: set DECISION_API_KEYS_FILE or DECISION_API_KEYS "
                 "(or DECISION_API_ALLOW_NO_AUTH=1 for tests only)"
             )
-        keystore = FileKeyStore(settings.api_keys)
+        keystore = FileKeyStore(settings.api_keys, allow_paid=settings.file_keys_allow_paid)
         auth_required = bool(settings.api_keys)
         if not auth_required:
             log.warning("DECISION_API_ALLOW_NO_AUTH=1: serving without authentication")
 
     backend_urls = registry.backend_urls()
+    upstream_models = [m for m in registry.models if not m.probed]
+    openrouter_key = read_openrouter_key(settings.openrouter_key_file)
+    if upstream_models and openrouter_key is None:
+        log.warning(
+            "registry has OpenRouter models (%s) but DECISION_API_OPENROUTER_KEY_FILE is not set; "
+            "requests for them get 503 backend_unavailable",
+            ", ".join(m.id for m in upstream_models),
+        )
+    upstream = None if openrouter_key is None else Upstream(openrouter_key, referer=settings.openrouter_referer)
 
     async def probe_backends(http: httpx.AsyncClient) -> dict[str, dict]:
         """Probe every distinct backend once and update ``backend_up`` for each model behind it."""
         probes = await asyncio.gather(*(probe(http, url, settings.health_timeout_s) for url in backend_urls))
         by_url = dict(zip(backend_urls, probes, strict=True))
-        for m in registry.models:
+        for m in registry.probed():
             mx.set_backend_up(m.id, by_url[m.backend_url]["status"] == "ok")
         return by_url
 
@@ -254,7 +266,7 @@ def create_app(
             await asyncio.sleep(interval)
             try:
                 await probe_backends(http)
-            except Exception as exc:  # never let the probe loop die
+            except Exception as exc:  # noqa: BLE001 (never let the probe loop die)
                 log.warning("periodic backend probe failed (%s)", type(exc).__name__)
 
     def start_metrics_server():
@@ -263,7 +275,7 @@ def create_app(
         host = settings.metrics_host or settings.host
         try:
             server = metrics.start_metrics_server(host=host, port=settings.metrics_port, registry=mx.registry)
-        except Exception as exc:  # metrics are best effort: the API keeps serving without them
+        except Exception as exc:  # noqa: BLE001 (metrics are best effort: the API keeps serving without them)
             log.error("metrics server not started on %s:%s (%s)", host, settings.metrics_port, exc)
             return None
         log.info("metrics on http://%s:%s/metrics", host, settings.metrics_port)
@@ -302,9 +314,25 @@ def create_app(
         openapi_url=None,
     )
 
+    def render_error(path: str, exc: ApiError, start: float):
+        """OpenRouter's error envelope on /api/alpha/*, the contract's ErrorEnvelope everywhere else."""
+        if alpha.is_alpha_path(path):
+            return alpha.error_response(exc)
+        return error_response(exc, _ms(start))
+
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError):
-        return error_response(exc, _ms(request.state.start))
+        return render_error(request.url.path, exc, request.state.start)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        """Unknown paths and methods under /api/alpha/* get OpenRouter's envelope; elsewhere FastAPI's default."""
+        if not alpha.is_alpha_path(request.url.path):
+            return await http_exception_handler(request, exc)
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "invalid_request")
+        message = exc.detail if isinstance(exc.detail, str) else "request failed"
+        body = {"error": {"code": exc.status_code, "message": message, "metadata": {"code": code, "param": None}}}
+        return JSONResponse(body, status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     @app.middleware("http")
     async def access_and_auth(request: Request, call_next):
@@ -321,18 +349,19 @@ def create_app(
                 token = bearer_token(request.headers.get("authorization"))
                 principal = keystore.authenticate(token) if token else None
                 if principal is None:
-                    response = error_response(ApiError("unauthorized", "missing or invalid API key"), _ms(start))
+                    response = render_error(path, ApiError("unauthorized", "missing or invalid API key"), start)
                 else:
                     kid = principal.key_id
+                    request.state.principal = principal
                     response = await call_next(request)
             else:
                 response = await call_next(request)
-        except Exception as exc:  # never leak internals to the client
+        except Exception as exc:  # noqa: BLE001 (never leak internals to the client)
             log.error("unhandled %s on %s %s", type(exc).__name__, request.method, admin_mod.log_path(path))
             if admin_path and admin is not None:
                 response = admin_mod.error_json("internal_error", "unexpected error")
             else:
-                response = error_response(ApiError("internal_error", "unexpected error"), _ms(start))
+                response = render_error(path, ApiError("internal_error", "unexpected error"), start)
         if admin_path and admin is not None:
             admin_mod.secure(response)
         latency_ms = _ms(start)
@@ -349,15 +378,18 @@ def create_app(
             )
         )
         mx.observe_request(path, model, response.status_code, kid, time.perf_counter() - start)
+        cost = getattr(request.state, "cost", 0.0)  # OpenRouter's usage.cost (finite, >= 0) for paid models
+        if cost and model:
+            mx.observe_cost(model, cost)
         if usage is not None and principal is not None and principal.public_id is not None:
-            usage.record(principal.public_id, mx.route(path), model, response.status_code, latency_ms)
+            usage.record(principal.public_id, mx.route(path), model, response.status_code, latency_ms, cost_usd=cost)
         return response
 
     def client(request: Request) -> httpx.AsyncClient:
         return request.app.state.http
 
     async def invoke(request: Request, entry, explicit: bool, data: dict, req) -> Result:
-        call = Call(client(request), entry, explicit, registry)
+        call = Call(client(request), entry, explicit, registry, upstream if entry.paid else None)
         started = time.perf_counter()
         try:
             result: Result = await ADAPTERS[entry.adapter].run(call, data, req)
@@ -445,32 +477,86 @@ def create_app(
             mx.observe_image_ignored(model)
         return response
 
+    @app.post("/api/alpha/decisions")
+    async def alpha_decisions(request: Request):
+        """OpenRouter Decisions API wire format (see openrouter_decisions.py)."""
+        plan = alpha.parse(_require_object(await read_json(request, alpha.BODY_LIMIT)))
+        entry = registry.resolve_decision(plan.model, media=plan.media)
+        request.state.model = entry.id
+        alpha.check_model(entry, plan)
+        if entry.paid:
+            principal = getattr(request.state, "principal", None)
+            allowed = principal.allow_paid if principal is not None else settings.file_keys_allow_paid
+            if not allowed:  # before any upstream call
+                raise ApiError(
+                    "forbidden",
+                    f"this API key is not allowed to use paid model {entry.id!r}; "
+                    "ask the owner to enable paid models for it",
+                    param="model",
+                )
+            if upstream is None:
+                raise ApiError(
+                    "backend_unavailable", f"model {entry.id!r} is not available: no OpenRouter key is configured"
+                )
+            result = await invoke(request, entry, True, alpha.upstream_body(plan, entry.backend_model), None)
+            body = alpha.render_upstream(entry.id, result.results, result.meta)
+            request.state.cost = alpha.usage_cost(body)
+            return JSONResponse(body)
+        if entry.adapter == "zero-shot-image":
+            payloads = alpha.siglip_payloads(plan)
+            reqs = [_validate(ImageClassifyRequest, p) for p in payloads]
+        else:
+            payloads = alpha.laya_payloads(plan)
+            reqs = [_validate(TextDecisionRequest, p) for p in payloads]
+        results = await asyncio.gather(
+            *(invoke(request, entry, True, p, r) for p, r in zip(payloads, reqs, strict=True))
+        )
+        model = request.state.model = results[0].model
+        if entry.adapter == "zero-shot-image":
+            return JSONResponse(alpha.render_siglip(plan, model, [r.results for r in results]))
+        return JSONResponse(alpha.render_laya(plan, model, [(r.results, r.meta) for r in results]))
+
     @app.get("/v1/health")
     async def health(request: Request):
         by_url = await probe_backends(client(request))
         up = [p["status"] == "ok" for p in by_url.values()]
         status = "ok" if all(up) else "degraded" if any(up) else "down"
-        return JSONResponse(
-            {
-                "status": status,
-                "backends": {
-                    "text": by_url[registry.default(TEXT_TASK).backend_url],
-                    "image": by_url[registry.default(IMAGE_TASK).backend_url],
-                },
-                "models": {m.id: by_url[m.backend_url] for m in registry.models},
+        body: dict[str, Any] = {
+            "status": status,
+            "backends": {
+                "text": by_url[registry.default(TEXT_TASK).backend_url],
+                "image": by_url[registry.default(IMAGE_TASK).backend_url],
             },
-            status_code=503 if status == "down" else 200,
-        )
+            "models": {m.id: by_url[m.backend_url] for m in registry.probed()},
+        }
+        if upstream_models:  # paid upstreams have no health endpoint: listed, never probed, never degrade status
+            body["upstreams"] = {
+                m.id: {"status": "not_probed", "configured": openrouter_key is not None} for m in upstream_models
+            }
+        return JSONResponse(body, status_code=503 if status == "down" else 200)
 
     @app.get(LIVENESS_PATH)
     async def healthz():
         return {"status": "ok"}
 
-    models = [{"id": m.id, "task": m.task, "backend": m.backend, "version": m.version} for m in registry.models]
+    models = []
+    for m in registry.models:
+        item = {
+            "id": m.id,
+            "task": m.task,
+            "backend": m.backend,
+            "version": m.version,
+            "capabilities": m.capabilities,
+            "paid": m.paid,
+        }
+        if m.paid:  # the upstream model id; local checkpoints stay internal
+            item["backend_model"] = m.backend_model
+        models.append(item)
+    aliases = registry.alias_list()
 
     @app.get("/v1/models")
     async def list_models():
-        return {"models": models}
+        return {"models": models, "aliases": aliases}
 
     if admin is not None:
         admin_mod.install(app, admin)

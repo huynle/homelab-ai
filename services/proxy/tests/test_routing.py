@@ -200,19 +200,35 @@ def test_image_wrong_or_unknown_model_is_400(rclient, auth, image_request, fleet
 
 
 def test_models_lists_registry_entries(rclient, auth):
+    TEXT = {"capabilities": ["text"], "paid": False}
+    IMAGE = {"capabilities": ["image"], "paid": False}
     assert rclient.get("/v1/models", headers=auth).json() == {
         "models": [
-            {"id": "laya-english", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
-            {"id": "laya-multilingual", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20"},
-            {"id": "laya-next", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.5.0"},
+            {"id": "laya-english", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.4.20", **TEXT},
+            {
+                "id": "laya-multilingual",
+                "task": "text-decision",
+                "backend": "laya",
+                "version": "laya-serve-0.4.20",
+                **TEXT,
+            },
+            {"id": "laya-next", "task": "text-decision", "backend": "laya", "version": "laya-serve-0.5.0", **TEXT},
             {
                 "id": "siglip2-base-patch16-224",
                 "task": "image-zero-shot",
                 "backend": "siglip2",
                 "version": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+                **IMAGE,
             },
-            {"id": "siglip2-large", "task": "image-zero-shot", "backend": "zero-shot-image", "version": "large-commit"},
-        ]
+            {
+                "id": "siglip2-large",
+                "task": "image-zero-shot",
+                "backend": "zero-shot-image",
+                "version": "large-commit",
+                **IMAGE,
+            },
+        ],
+        "aliases": [],
     }
 
 

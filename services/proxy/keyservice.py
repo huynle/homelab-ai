@@ -35,7 +35,15 @@ IMPORTED_NAME = "imported (SOPS)"
 IMPORTED_PREFIX = "imported…"
 GROUP_BY = ("day", "key", "model", "route")
 AUDIT_EVENTS = frozenset(
-    {"sign_in.allowed", "sign_in.denied", "member.invited", "member.removed", "key.created", "key.revoked"}
+    {
+        "sign_in.allowed",
+        "sign_in.denied",
+        "member.invited",
+        "member.removed",
+        "key.created",
+        "key.revoked",
+        "key.paid_access_changed",
+    }
 )
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -101,7 +109,7 @@ def _expiry(expires_at: datetime | str | None, now: datetime) -> str | None:
         return None
     if isinstance(expires_at, str):
         try:
-            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))  # noqa: FURB162 (3.10)
         except ValueError:
             raise ServiceError("invalid_request", "expires_at: must be an RFC 3339 date-time") from None
     if not isinstance(expires_at, datetime) or expires_at.tzinfo is None:
@@ -134,6 +142,7 @@ def _key_dict(row: Mapping, now_iso: str) -> dict:
         "revoked_at": row["revoked_at"],
         "last_used_at": row["last_used_at"],
         "rate_limit_rpm": row["rate_limit_rpm"],
+        "allow_paid": bool(row["allow_paid"]),
     }
 
 
@@ -381,6 +390,34 @@ def rename_key(db: Database, viewer: Viewer, public_id: Any, name: Any, *, now: 
     return _key_dict(row, now_iso)
 
 
+def set_paid_access(db: Database, viewer: Viewer, public_id: Any, allow: Any, *, now: datetime | None = None) -> dict:
+    """Owner only: let a key use paid (OpenRouter) models, or stop it. Applies on the key's next request.
+
+    Audited as ``key.paid_access_changed`` when the value changes. A revoked key cannot be changed.
+    """
+    _require_owner(viewer)
+    if not isinstance(allow, bool):
+        raise ServiceError("invalid_request", "allow_paid: must be true or false")
+    now_iso = iso(_now(now))
+    with db.write() as conn:
+        row = _visible_key(conn, viewer, public_id)
+        if row["revoked_at"]:
+            raise ServiceError("conflict", "key is revoked")
+        if bool(row["allow_paid"]) != allow:
+            conn.execute("UPDATE api_keys SET allow_paid = ? WHERE public_id = ?", (int(allow), row["public_id"]))
+            _audit(
+                conn,
+                "key.paid_access_changed",
+                now_iso,
+                viewer.email,
+                row["owner_email"],
+                row["public_id"],
+                {"allow_paid": allow},
+            )
+            row = conn.execute("SELECT * FROM api_keys WHERE public_id = ?", (row["public_id"],)).fetchone()
+    return _key_dict(row, now_iso)
+
+
 def revoke_key(db: Database, viewer: Viewer, public_id: Any, *, now: datetime | None = None) -> dict:
     """Soft, immediate, permanent. Idempotent: an already revoked key keeps its time and gets no new audit entry."""
     now_iso = iso(_now(now))
@@ -447,7 +484,7 @@ def _date_range(from_: Any, to: Any, today: date | None) -> tuple[date, date]:
     return start, end
 
 
-def _totals(requests: int, client_errors: int, server_errors: int, latency: float) -> dict:
+def _totals(requests: int, client_errors: int, server_errors: int, latency: float, cost: float = 0.0) -> dict:
     return {
         "requests": requests,
         "errors": client_errors + server_errors,
@@ -455,6 +492,7 @@ def _totals(requests: int, client_errors: int, server_errors: int, latency: floa
         "server_errors": server_errors,
         "total_latency_ms": round(float(latency), 3),
         "avg_latency_ms": round(latency / requests, 4) if requests else None,
+        "cost_usd": round(float(cost or 0.0), 9),
     }
 
 
@@ -495,7 +533,7 @@ def usage_query(
         }[group_by]
         rows = conn.execute(
             f"SELECT {dims}, sum(u.requests) AS req, sum(u.client_errors) AS ce, sum(u.server_errors) AS se,"
-            f" sum(u.latency_ms_sum) AS lat FROM usage_daily u JOIN api_keys k ON k.public_id = u.public_id"
+            f" sum(u.latency_ms_sum) AS lat, sum(u.cost_usd_sum) AS cost FROM usage_daily u JOIN api_keys k ON k.public_id = u.public_id"
             f" WHERE {' AND '.join(where)} GROUP BY {dims} HAVING sum(u.requests) > 0",
             args,
         ).fetchall()
@@ -509,13 +547,17 @@ def usage_query(
             dim = {"model": r["model"] or None}
         else:
             dim = {"route": r["route"]}
-        out.append({**dim, **_totals(r["req"], r["ce"], r["se"], r["lat"])})
+        out.append({**dim, **_totals(r["req"], r["ce"], r["se"], r["lat"], r["cost"])})
     if group_by == "day":
         out.sort(key=lambda row: row["date"])
     else:
         out.sort(key=lambda row: (-row["requests"], str(next(iter(row.values())) or "")))
     total = _totals(
-        sum(r["req"] for r in rows), sum(r["ce"] for r in rows), sum(r["se"] for r in rows), sum(r["lat"] for r in rows)
+        sum(r["req"] for r in rows),
+        sum(r["ce"] for r in rows),
+        sum(r["se"] for r in rows),
+        sum(r["lat"] for r in rows),
+        sum(r["cost"] for r in rows),
     )
     return {"from": start.isoformat(), "to": end.isoformat(), "group_by": group_by, "rows": out, "total": total}
 

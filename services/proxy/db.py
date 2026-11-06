@@ -111,18 +111,20 @@ def upsert_usage(
     client_errors: int,
     server_errors: int,
     latency_ms_sum: float,
+    cost_usd_sum: float = 0.0,
 ) -> None:
     """Add to one usage_daily row. ``model`` None is stored as '' so the row's primary key stays unique."""
     conn.execute(
         "INSERT INTO usage_daily"
-        " (day, public_id, route, model, requests, client_errors, server_errors, latency_ms_sum)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        " (day, public_id, route, model, requests, client_errors, server_errors, latency_ms_sum, cost_usd_sum)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT (day, public_id, route, model) DO UPDATE SET"
         "  requests = requests + excluded.requests,"
         "  client_errors = client_errors + excluded.client_errors,"
         "  server_errors = server_errors + excluded.server_errors,"
-        "  latency_ms_sum = latency_ms_sum + excluded.latency_ms_sum",
-        (day, public_id, route, model or "", requests, client_errors, server_errors, latency_ms_sum),
+        "  latency_ms_sum = latency_ms_sum + excluded.latency_ms_sum,"
+        "  cost_usd_sum = cost_usd_sum + excluded.cost_usd_sum",
+        (day, public_id, route, model or "", requests, client_errors, server_errors, latency_ms_sum, cost_usd_sum),
     )
 
 
