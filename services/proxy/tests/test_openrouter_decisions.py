@@ -163,6 +163,17 @@ def test_invalid_requests(c, backends, body, param):
     assert predict_calls(backends) == []
 
 
+def test_unknown_paths_and_methods_use_the_openrouter_envelope(c):
+    or_error(c.get(PATH, headers=AUTH), 405, "method_not_allowed")
+    or_error(c.post("/api/alpha/nope", json={}, headers=AUTH), 404, "not_found")
+
+
+def test_unknown_paths_elsewhere_keep_the_fastapi_body(c):
+    resp = c.get("/v1/nope", headers=AUTH)
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}
+
+
 def test_body_must_be_a_json_object(c):
     or_error(c.post(PATH, content=b"[1]", headers=AUTH), 400, "invalid_request")
     or_error(c.post(PATH, content=b'{"model": NaN}', headers=AUTH), 400, "invalid_request")

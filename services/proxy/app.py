@@ -21,8 +21,10 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import admin as admin_mod
 import decisions
@@ -321,6 +323,16 @@ def create_app(
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError):
         return render_error(request.url.path, exc, request.state.start)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        """Unknown paths and methods under /api/alpha/* get OpenRouter's envelope; elsewhere FastAPI's default."""
+        if not alpha.is_alpha_path(request.url.path):
+            return await http_exception_handler(request, exc)
+        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "invalid_request")
+        message = exc.detail if isinstance(exc.detail, str) else "request failed"
+        body = {"error": {"code": exc.status_code, "message": message, "metadata": {"code": code, "param": None}}}
+        return JSONResponse(body, status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     @app.middleware("http")
     async def access_and_auth(request: Request, call_next):
