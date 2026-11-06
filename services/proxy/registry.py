@@ -31,7 +31,9 @@ log = logging.getLogger("decision_api")
 
 TEXT_TASK = "text-decision"
 IMAGE_TASK = "image-zero-shot"
-Task = Literal["text-decision", "image-zero-shot"]
+DECISIONS_TASK = "decisions"  # OpenRouter-native; served only by POST /api/alpha/decisions
+Task = Literal["text-decision", "image-zero-shot", "decisions"]
+Capability = Literal["text", "image", "box", "audio", "video"]
 DEFAULT_TIMEOUT_S = 10.0
 
 # Laya's own checkpoint aliases (api/fixtures/laya-models.json). A text request may still pin a checkpoint
@@ -66,6 +68,18 @@ class ModelEntry(BaseModel):
     backend: NonEmpty | None = None  # label shown in /v1/models; defaults to the adapter key
     version: NonEmpty
     timeout_s: Annotated[float, Field(gt=0, le=600, strict=False)] = DEFAULT_TIMEOUT_S
+    # What the model accepts. Fixed by the adapter for local backends; required for openrouter entries.
+    capabilities: Annotated[list[Capability], Field(min_length=1)] | None = None
+
+    @property
+    def paid(self) -> bool:
+        """Calls cost money upstream (adapter openrouter); only keys with paid access may use the model."""
+        return ADAPTERS[self.adapter].paid
+
+    @property
+    def probed(self) -> bool:
+        """GET /v1/health probes the backend. OpenRouter has no health endpoint and is never probed."""
+        return not self.paid
 
     @field_validator("backend_url")
     @classmethod
@@ -82,6 +96,23 @@ class ModelEntry(BaseModel):
             raise ValueError(f"unknown adapter {self.adapter!r} (known: {', '.join(sorted(ADAPTERS))})")
         if adapter.task != self.task:
             raise ValueError(f"adapter {self.adapter!r} serves {adapter.task}, not {self.task}")
+        if adapter.capabilities is not None:
+            if "capabilities" in self.model_fields_set:
+                raise ValueError(
+                    f"capabilities are fixed for adapter {self.adapter!r} ({', '.join(adapter.capabilities)}); "
+                    "remove the field"
+                )
+            # bypass fields_set: the value is derived, and the entry is validated again inside Registry
+            self.__dict__["capabilities"] = list(adapter.capabilities)
+        elif self.capabilities is None:
+            raise ValueError(f"adapter {self.adapter!r} needs capabilities (a list of: text, image, box, audio, video)")
+        else:
+            self.capabilities = list(dict.fromkeys(self.capabilities))
+        if self.adapter == "openrouter":
+            if self.backend_model is None:
+                raise ValueError("adapter 'openrouter' needs backend_model (the OpenRouter model id)")
+            if urlsplit(self.backend_url).scheme != "https":
+                raise ValueError("adapter 'openrouter' needs an https backend_url, e.g. https://openrouter.ai/api")
         if self.backend is None:
             self.backend = self.adapter
         return self
@@ -97,11 +128,22 @@ class Defaults(BaseModel):
 DEFAULT_TASKS = {"text": TEXT_TASK, "image": IMAGE_TASK}
 
 
+class AliasTargets(BaseModel):
+    """``{text: <id>, image: <id>}``: the image target serves requests with media or box questions."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: ModelId
+    image: ModelId
+
+
 class Registry(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     defaults: Defaults
     models: Annotated[list[ModelEntry], Field(min_length=1)]
+    # Names for POST /api/alpha/decisions only: `name: <model id>` or `name: {text: <id>, image: <id>}`.
+    aliases: dict[ModelId, ModelId | AliasTargets] = Field(default_factory=dict)
     _by_id: dict[str, ModelEntry] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
@@ -118,6 +160,15 @@ class Registry(BaseModel):
                 raise ValueError(f"default {key} model {wanted!r} is not in models")
             if entry.task != task:
                 raise ValueError(f"default {key} model {wanted!r} serves {entry.task}, not {task}")
+        for name, target in self.aliases.items():
+            if name in by_id:
+                raise ValueError(f"alias {name!r} has the same name as a model id")
+            targets = (target,) if isinstance(target, str) else (target.text, target.image)
+            for t in targets:
+                if t in self.aliases:
+                    raise ValueError(f"alias {name!r} points at alias {t!r}; aliases must name model ids")
+                if t not in by_id:
+                    raise ValueError(f"alias {name!r} points at {t!r}, which is not in models")
         self._by_id = by_id
         return self
 
@@ -136,9 +187,42 @@ class Registry(BaseModel):
     def for_task(self, task: str) -> list[ModelEntry]:
         return [m for m in self.models if m.task == task]
 
+    def probed(self) -> list[ModelEntry]:
+        """Models whose backend GET /v1/health probes (not openrouter)."""
+        return [m for m in self.models if m.probed]
+
     def backend_urls(self) -> list[str]:
-        """Distinct backend URLs in registry order."""
-        return list(dict.fromkeys(m.backend_url for m in self.models))
+        """Distinct probed backend URLs in registry order."""
+        return list(dict.fromkeys(m.backend_url for m in self.probed()))
+
+    def alias_list(self) -> list[dict]:
+        """Aliases as ``{id, text, image}`` (a single-target alias has the same id twice)."""
+        out = []
+        for name, target in self.aliases.items():
+            text, image = (target, target) if isinstance(target, str) else (target.text, target.image)
+            out.append({"id": name, "text": text, "image": image})
+        return out
+
+    def resolve_decision(self, name: str, *, media: bool) -> ModelEntry:
+        """The model for POST /api/alpha/decisions: a model id, an alias, or a Laya checkpoint name.
+
+        ``media``: the request has media parts, assets or box questions, so an alias picks its image target.
+        """
+        target = self.aliases.get(name)
+        if target is not None:
+            if not isinstance(target, str):
+                target = target.image if media else target.text
+            return self._by_id[target]
+        entry = self.find(name)
+        if entry is None:
+            candidate = self.find(f"laya-{LAYA_ALIASES.get(name, name)}")
+            if candidate is not None and candidate.adapter == "laya":
+                entry = candidate
+        if entry is None:
+            shown = name if len(name) <= 80 else name[:80] + "..."
+            valid = ", ".join([m.id for m in self.models] + list(self.aliases))
+            raise ApiError("invalid_request", f"unknown model {shown!r}; valid models and aliases: {valid}", param="model")
+        return entry
 
     def resolve(self, task: str, name: str | None) -> tuple[ModelEntry, bool]:
         """Pick the entry for a request: ``(entry, explicit)``. Unknown or wrong-task names raise 400."""

@@ -134,6 +134,9 @@ async def call_backend(
 
 class Adapter:
     task: ClassVar[str]
+    # What the backend accepts (text, image, box, audio, video). None: each registry entry must list them.
+    capabilities: ClassVar[tuple[str, ...] | None] = None
+    paid: ClassVar[bool] = False  # calls cost money upstream; only keys with paid access may use them
 
     async def run(self, call: Call, data: dict, req: Any) -> Result:  # pragma: no cover - interface
         raise NotImplementedError
@@ -143,6 +146,7 @@ class LayaAdapter(Adapter):
     """Laya ``POST /predict``: typed text decisions."""
 
     task = "text-decision"
+    capabilities = ("text",)
 
     async def run(self, call: Call, data: dict, req: Any) -> Result:
         entry = call.entry
@@ -184,6 +188,7 @@ class ZeroShotImageAdapter(Adapter):
     """Zero-shot image classification service ``POST /classify`` (services/image, SigLIP2)."""
 
     task = "image-zero-shot"
+    capabilities = ("image",)
 
     async def run(self, call: Call, data: dict, req: Any) -> Result:
         entry = call.entry
@@ -211,7 +216,18 @@ class ZeroShotImageAdapter(Adapter):
         return Result(entry.id, version if isinstance(version, str) and version else entry.version, results, meta)
 
 
+class OpenRouterAdapter(Adapter):
+    """OpenRouter ``POST /api/alpha/decisions`` (paid): the client's request forwarded with the upstream model id."""
+
+    task = "decisions"
+    paid = True
+
+    async def run(self, call: Call, data: dict, req: Any) -> Result:
+        raise NotImplementedError
+
+
 ADAPTERS: dict[str, Adapter] = {
     "laya": LayaAdapter(),
     "zero-shot-image": ZeroShotImageAdapter(),
+    "openrouter": OpenRouterAdapter(),
 }
