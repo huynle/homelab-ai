@@ -1,7 +1,8 @@
 # homelab-ai
 
 Homelab AI services. The main one is the **decision API**: a small authenticated HTTP API for typed
-text decisions (Laya) and zero-shot image classification (SigLIP2), served at
+text decisions (Laya) and zero-shot image classification (SigLIP2), with optional paid OpenRouter models
+(for example TypeSafe Jev) for keys the owner allows, served at
 **https://decide.ai.huynle.com**.
 
 | Route | Backend | Purpose |
@@ -9,8 +10,9 @@ text decisions (Laya) and zero-shot image classification (SigLIP2), served at
 | `POST /v1/decide/text` | Laya text server | `choice`, `score`, and `noul` (yes/no/unknown) answers about a text `state` |
 | `POST /v1/classify/image` | SigLIP2 `siglip2-base-patch16-224` | pick among `candidate_labels` for an image |
 | `POST /v1/decisions` | Laya, or SigLIP2 for one image | [OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions) wire format (`predicate`, `choice`, `score`) |
-| `GET /v1/health` | both | readiness (no auth) |
-| `GET /v1/models` | both | served models |
+| `POST /api/alpha/decisions` | Laya, SigLIP2, or OpenRouter (paid) | [OpenRouter Decisions](https://openrouter.ai/docs/guides/community/multimodal-decisions) wire format (`noul`, `choice`, `score`, `box`) |
+| `GET /v1/health` | local backends | readiness (no auth) |
+| `GET /v1/models` | registry | served models, capabilities and aliases |
 | `GET /healthz` | none | proxy liveness (no auth) |
 
 ## Architecture
@@ -133,6 +135,34 @@ text or JSON is ignored (the response says so with `X-Decision-Image: ignored`),
 own, with `choice` questions, is answered by SigLIP2. Hosted image URLs and more than one image return
 400. See the
 [contract](api/decision-api.yaml) (`createDecision`) for the mapping and limits.
+
+### OpenRouter Decisions API
+
+`POST /api/alpha/decisions` takes OpenRouter's Decisions body at OpenRouter's own path, so OpenRouter
+SDKs work by changing only the base URL. `model` is required: a model id or alias from `/v1/models`.
+With the default registry, `auto` answers text with the local Laya and sends images and box questions to
+the paid `jev` (allowed keys only; others get 403):
+
+```bash
+curl -s $DECISION_API/api/alpha/decisions \
+  -H "Authorization: Bearer $DECISION_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "auto",
+    "state": {"ticket": "My checkout page shows a blank screen after I click Pay."},
+    "questions": {
+      "is_bug": {"type": "noul", "instructions": "Is the customer reporting a software defect?"},
+      "team": {"type": "choice", "instructions": "Which team should own this ticket?",
+               "criteria": {"account": "Login or profile issues", "payments": "Checkout or billing issues"}}
+    }
+  }'
+# {"model":"laya-english","answers":{"is_bug":{"type":"noul","noul":0.8},"team":{"type":"choice",...}},
+#  "usage":{"input_tokens":...,"output_tokens":0,"cost":0},"id":"gen-dec-...","provider":"homelab"}
+```
+
+Errors on this route use OpenRouter's envelope (`error.code` is the HTTP status). See
+[`api/README.md`](api/README.md#openrouter-decisions-api) for aliases, capabilities, what is forwarded to
+OpenRouter and the local translation rules.
 
 Typical latency through the public route from the LAN: text decisions about 0.16–0.26 s, image
 classification of a photo about 0.35 s. See the [runbook's known caveats](docs/runbook.md#known-caveats).

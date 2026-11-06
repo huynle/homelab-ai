@@ -11,6 +11,7 @@ This repo holds the code. Deployment config lives in the private `huynle/infra` 
 | `apps/homelab/decision-api/release.yaml` | Namespace, HelmRelease (proxy Deployment, Service, NetworkPolicy, Traefik ingress) |
 | `apps/homelab/decision-api/registry.yaml` | Backend registry, generated as ConfigMap `decision-api-registry` |
 | `apps/homelab/decision-api/decision-api-keys.sops.yaml` | API keys (SOPS-encrypted Secret `decision-api-keys`) |
+| (to add) an OpenRouter key Secret | The OpenRouter API key for paid models, mounted as a file for `DECISION_API_OPENROUTER_KEY_FILE` (see [Paid OpenRouter models](#paid-openrouter-models)) |
 | `apps/homelab/decision-api/image-policy.yaml` | Flux image repository/policy for the proxy image |
 | `hosts/ml/decision-api/` | systemd units, env files, `deploy.sh`, `firewall.sh` for the backends on ml |
 | `docs/decisions/0030-decision-api-public-api-key-route.md` | Why the API is public behind API keys |
@@ -96,6 +97,52 @@ backend code. A unit that exits right after start usually shows an `AttributeErr
    pod by itself): `kubectl -n decision-api rollout restart deploy/decision-api`, run through the infra
    GitOps workflow.
 5. `GET /v1/models` lists the new id and `GET /v1/health` reports it under `models`.
+
+## Paid OpenRouter models
+
+`POST /api/alpha/decisions` can forward to OpenRouter models (registry entries with `adapter: openrouter`,
+for example `jev` = `typesafe/jev-1.14`). They cost OpenRouter credits, so they are off for every key until
+the owner turns them on.
+
+### OpenRouter key
+
+1. Create a key at https://openrouter.ai/settings/keys with a **credit limit** (the proxy has no budget of
+   its own). Never paste it into Brain, chat or a shared terminal.
+2. Store it as a SOPS-encrypted Secret in infra `apps/homelab/decision-api/` (one line, the key only), mount
+   it read-only into the pod (`defaultMode: 0400`, readable by uid 10001), and set
+   `DECISION_API_OPENROUTER_KEY_FILE` to the mounted path. NetworkPolicy egress must allow `openrouter.ai`
+   on 443.
+3. Restart the proxy. An unreadable or empty key file stops the proxy at startup. Without the variable the
+   proxy starts with a warning and OpenRouter models answer `503 backend_unavailable`;
+   `GET /v1/health` shows `"upstreams": {"jev": {"status": "not_probed", "configured": false}}`.
+4. Rotate: replace the Secret value, restart, then delete the old key in OpenRouter.
+
+Optional: `DECISION_API_OPENROUTER_REFERER` (default `https://decide.ai.huynle.com`) is the `HTTP-Referer`
+OpenRouter uses for app attribution.
+
+### Registry models and aliases
+
+Add the model and the aliases to infra `apps/homelab/decision-api/registry.yaml` (copy the `jev` entry and
+`aliases` from [`registry.example.yaml`](../services/proxy/registry.example.yaml)): `capabilities` must
+list what the model accepts (`text`, `image`, `box`, `audio`, `video`). `auto: {text: laya-english,
+image: jev}` keeps text on the free local Laya and sends images, assets and box questions to `jev`. Merge,
+restart the proxy, and check `GET /v1/models` (`paid: true`, `aliases`). OpenRouter models are reachable
+only through `POST /api/alpha/decisions`, never the `/v1` routes.
+
+### Enable paid access for a key
+
+SQLite key store (admin page): as the owner, open `/admin/keys` and press **Allow paid models** on the key
+(or `PATCH /admin/api/keys/{id}` with `{"allow_paid": true}`). It applies on the key's next request and is
+audited as `key.paid_access_changed`; **Deny paid models** turns it off the same way. Members see the value
+but cannot change it. Keys without paid access get `403 forbidden` for paid models and nothing is sent to
+OpenRouter. In file mode (`KEYSTORE=file`) paid access is all or nothing:
+`DECISION_API_FILE_KEYS_ALLOW_PAID=1` (meant for dev and tests).
+
+### Cost
+
+OpenRouter's `usage.cost` (USD credits) is returned to the caller, summed per key and day in the admin
+usage report (`cost_usd`, by day, key, model or route), and counted in the metric
+`decision_api_upstream_cost_usd_total{model}`. Check the OpenRouter dashboard for the authoritative bill.
 
 ## API key management
 
@@ -214,6 +261,19 @@ The proxy could not connect to a backend; `/v1/health` shows which one.
 
 `504 backend_timeout` means the backend accepted the request but took longer than the entry's
 `timeout_s` (10 s). `502 backend_error` means it answered with an error; check its journal.
+
+For an OpenRouter model (`/api/alpha/decisions`), 503 means no OpenRouter key is configured (see
+`upstreams` in `/v1/health`) or OpenRouter itself is unavailable or unreachable (egress to
+`openrouter.ai:443`).
+
+### OpenRouter errors on `/api/alpha/decisions`
+
+- `403 forbidden`: the key has no paid access; see [Enable paid access for a key](#enable-paid-access-for-a-key).
+- `502` with "upstream rejected the request (credentials or credits)": OpenRouter refused the proxy's key
+  (401/403) or the account is out of credits (402). Check the key and credits in OpenRouter.
+- `429 rate_limited`: OpenRouter rate-limited the request; back off.
+- `400` with "upstream rejected the request: ...": OpenRouter's own validation message (for example a box
+  question to a model that cannot answer it).
 
 ### Cannot connect at all
 
